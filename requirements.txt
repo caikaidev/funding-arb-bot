@@ -1,0 +1,18 @@
+# 交易所接口
+ccxt>=4.0.0                   # 只用于读取行情/费率（不下单）
+binance-connector>=3.5.0      # Binance 官方 SDK - 现货
+binance-futures-connector>=4.0.0  # Binance 官方 SDK - 合约
+
+# 异步 & 调度
+aiohttp>=3.9.0
+apscheduler>=3.10.0
+
+# 数据 & 配置
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# 通知
+python-telegram-bot>=20.0
+
+# 日志
+loguru>=0.7.0

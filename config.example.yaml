@@ -1,0 +1,99 @@
+# ============================================
+# 资金费率套利机器人 v4 — 比例驱动配置
+# ============================================
+# 只需修改 initial_capital，其余全部按比例自动计算
+#
+# 使用方式:
+#   cp config.example.yaml config.yaml
+#   vim config.yaml   # 填入 API Key、Telegram Token
+
+exchanges:
+  binance:
+    api_key: "YOUR_BINANCE_API_KEY"
+    api_secret: "YOUR_BINANCE_API_SECRET"
+
+# --------------------------------------------------
+# 💰 唯一需要设置的：初始资金
+#    启动时也可通过命令行覆盖: python main.py --capital 20000
+# --------------------------------------------------
+initial_capital: 10000
+
+# --------------------------------------------------
+# 资金分配比例 (总和 = 100%)
+# --------------------------------------------------
+allocation:
+  tradable_pct: 0.80          # 80% 用于套利
+  reserve_pct: 0.15           # 15% 链上底仓 (Aave)
+  emergency_pct: 0.05         # 5%  应急备用
+
+# --------------------------------------------------
+# 分级配置（全部用占 tradable 的比例）
+# --------------------------------------------------
+tiers:
+  t3_enabled: false
+
+  without_t3:
+    max_positions: 3
+    t1:
+      position_pct: 0.375     # 单仓占可套利资金的 37.5% → $10k 时 = $3,000
+      max_count: 2
+    t2:
+      position_pct: 0.3125    # 31.25% → $10k 时 = $2,500
+      max_count: 2
+
+  with_t3:
+    max_positions: 4
+    t1:
+      position_pct: 0.3125    # → $2,500
+      max_count: 2
+    t2:
+      position_pct: 0.25      # → $2,000
+      max_count: 2
+    t3:
+      position_pct: 0.125     # → $1,000
+      max_count: 2
+      total_pct: 0.25         # T3 合计不超过 tradable 的 25% → $2,000
+
+# --------------------------------------------------
+# 筛选门槛（不变）
+# --------------------------------------------------
+strategy:
+  whitelist:
+    - "BTCUSDT"
+    - "ETHUSDT"
+
+  entry:
+    min_funding_rate: 0.0002
+    min_annualized: 0.15
+    max_spread_pct: 0.001
+
+  exit:
+    rate_reverse_count: 3
+    min_profitable_rate: 0.00005
+    max_holding_days: 30
+
+  risk:
+    max_leverage: 1
+    max_slippage: 0.002
+    daily_loss_limit_pct: 0.005   # 单日亏损上限 = 本金的 0.5%
+
+# --------------------------------------------------
+# 手续费
+# --------------------------------------------------
+fees:
+  spot_taker: 0.001
+  spot_maker: 0.001
+  futures_taker: 0.0004
+  futures_maker: 0.0002
+  rebate_rate: 0.30
+
+# --------------------------------------------------
+# 通知 & 调度
+# --------------------------------------------------
+telegram:
+  enabled: true
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+  chat_id: "YOUR_CHAT_ID"
+
+schedule:
+  check_interval_minutes: 5
