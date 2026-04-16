@@ -123,5 +123,42 @@ class FundingRateMonitor:
             logger.error(f"获取 {symbol} 行情失败: {e}")
             return None
 
+    async def fetch_basis(self, symbol: str) -> dict | None:
+        """
+        获取现货-永续价差（基差）
+
+        Args:
+            symbol: ccxt 永续合约格式，如 'BTC/USDT:USDT'
+
+        Returns:
+            {'basis_pct': float, 'spot_price': float, 'perp_price': float}
+            基差为正表示永续溢价（合约 > 现货）
+        """
+        try:
+            # 永续: 'BTC/USDT:USDT' → 现货: 'BTC/USDT'
+            spot_symbol = symbol.split(":")[0]
+
+            # 并发获取两个 ticker，减少延迟
+            perp_ticker, spot_ticker = await asyncio.gather(
+                self.exchange.fetch_ticker(symbol),
+                self.exchange.fetch_ticker(spot_symbol),
+            )
+
+            perp_last = float(perp_ticker.get("last") or 0)
+            spot_last = float(spot_ticker.get("last") or 0)
+
+            if not spot_last:
+                return None
+
+            basis_pct = (perp_last - spot_last) / spot_last
+            return {
+                "basis_pct": basis_pct,
+                "spot_price": spot_last,
+                "perp_price": perp_last,
+            }
+        except Exception as e:
+            logger.warning(f"获取 {symbol} 基差失败: {e}")
+            return None
+
     async def close(self):
         await self.exchange.close()

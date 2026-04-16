@@ -1,6 +1,7 @@
 """
 仓位管理模块 — SQLite 存储所有交易记录，追踪盈亏
 """
+import json
 import sqlite3
 from datetime import datetime, timezone
 from loguru import logger
@@ -60,26 +61,73 @@ class PositionManager:
         """)
         self.conn.commit()
 
+        # 迁移：为旧数据库添加基差列（已存在时静默忽略）
+        for col in ("open_basis", "close_basis"):
+            try:
+                self.conn.execute(f"ALTER TABLE positions ADD COLUMN {col} REAL DEFAULT NULL")
+                self.conn.commit()
+            except Exception:
+                pass  # 列已存在
+
     # ------------------------------------------------------------------
     # 开仓记录
     # ------------------------------------------------------------------
     def record_open(
         self, symbol, direction, quantity, spot_price,
-        futures_price, usdt_amount, slippage, fees_paid
+        futures_price, usdt_amount, slippage, fees_paid,
+        open_basis: float = None,
     ) -> int:
         now = datetime.now(timezone.utc).isoformat()
         cursor = self.conn.execute(
             """INSERT INTO positions
                (symbol, direction, quantity, spot_price, futures_price,
-                usdt_amount, slippage, fees_paid, opened_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                usdt_amount, slippage, fees_paid, opened_at, open_basis)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (symbol, direction, quantity, spot_price,
-             futures_price, usdt_amount, slippage, fees_paid, now),
+             futures_price, usdt_amount, slippage, fees_paid, now, open_basis),
         )
         self.conn.commit()
         pos_id = cursor.lastrowid
-        logger.info(f"记录开仓: #{pos_id} {symbol} {direction} ${usdt_amount:.2f}")
+        basis_str = f" | 基差 {open_basis:+.4%}" if open_basis is not None else ""
+        logger.info(f"记录开仓: #{pos_id} {symbol} {direction} ${usdt_amount:.2f}{basis_str}")
         return pos_id
+
+    # ------------------------------------------------------------------
+    # 单腿成交记录（开仓/平仓各写两条：现货腿 + 合约腿）
+    # ------------------------------------------------------------------
+    def record_trade(
+        self,
+        position_id: int,
+        action: str,
+        side: str,
+        market: str,
+        symbol: str,
+        quantity: float,
+        price: float,
+        fee: float = None,
+        raw_response: dict = None,
+    ):
+        """
+        写入 trade_logs
+
+        Args:
+            action: 'open' | 'close'
+            side:   'BUY' | 'SELL'
+            market: 'spot' | 'futures'
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """INSERT INTO trade_logs
+               (position_id, action, side, market, symbol, quantity, price, fee, raw_response, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                position_id, action, side, market, symbol,
+                quantity, price, fee,
+                json.dumps(raw_response) if raw_response else None,
+                now,
+            ),
+        )
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # 费率收入记录
@@ -99,16 +147,20 @@ class PositionManager:
     # ------------------------------------------------------------------
     # 平仓记录
     # ------------------------------------------------------------------
-    def record_close(self, position_id: int, close_pnl: float, fees: float, rebate: float):
+    def record_close(
+        self, position_id: int, close_pnl: float, fees: float, rebate: float,
+        close_basis: float = None,
+    ):
         now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             """UPDATE positions SET
                status = 'closed', closed_at = ?,
                close_pnl = ?, fees_paid = fees_paid + ?,
                fees_rebated = fees_rebated + ?,
-               net_pnl = funding_earned + ? - fees_paid - ? + fees_rebated + ?
+               net_pnl = funding_earned + ? - fees_paid - ? + fees_rebated + ?,
+               close_basis = ?
                WHERE id = ?""",
-            (now, close_pnl, fees, rebate, close_pnl, fees, rebate, position_id),
+            (now, close_pnl, fees, rebate, close_pnl, fees, rebate, close_basis, position_id),
         )
         self.conn.commit()
         logger.info(f"记录平仓: #{position_id}")

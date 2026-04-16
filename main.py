@@ -121,6 +121,7 @@ class FundingArbitrageBot:
 
         except Exception as e:
             logger.exception(f"监控异常: {e}")
+            # 监控模式无 notifier，无需处理
 
     # ==================================================================
     # 模拟 / 实盘：扫描→开仓
@@ -139,6 +140,23 @@ class FundingArbitrageBot:
                 logger.info(f"可用不足 ${available:.0f}")
                 return
 
+            # BNB 余额检查（每次扫描检查一次）
+            if self.fees_cfg.get("use_bnb_discount", False):
+                bnb_balance = self.executor.check_bnb_balance()
+                bnb_min = self.fees_cfg.get("bnb_min_balance", 0.05)
+                if bnb_balance < bnb_min:
+                    logger.warning(f"BNB 余额不足: {bnb_balance:.4f} BNB < {bnb_min} BNB，请及时补充")
+                    if self.notifier:
+                        try:
+                            await self.notifier.on_error(
+                                f"BNB 余额不足 {bnb_balance:.4f} BNB（建议 >{bnb_min}），手续费折扣可能失效"
+                            )
+                        except Exception:
+                            pass
+
+            order_priority = self.config["strategy"].get("order_priority", "concurrent")
+            max_basis = self.config["strategy"]["entry"].get("max_basis_pct", 0.001)
+
             for coin in qualified:
                 ok, alloc, reason = self.screener.check_allocation(coin, open_pos)
                 if not ok:
@@ -147,6 +165,17 @@ class FundingArbitrageBot:
                 if alloc < 200:
                     continue
 
+                # 基差检查：基差过大时暂缓开仓，等待收敛
+                ccxt_sym = _to_ccxt(coin["binance_symbol"])
+                basis_data = await self.monitor.fetch_basis(ccxt_sym)
+                if basis_data and abs(basis_data["basis_pct"]) > max_basis:
+                    logger.info(
+                        f"跳过 {coin['binance_symbol']}: 基差过大 "
+                        f"{basis_data['basis_pct']:+.4%} > {max_basis:.4%}"
+                    )
+                    continue
+                open_basis = basis_data["basis_pct"] if basis_data else None
+
                 self.executor.set_leverage(coin["binance_symbol"], self.risk["max_leverage"])
 
                 result = self.executor.open_arbitrage(
@@ -154,11 +183,12 @@ class FundingArbitrageBot:
                     usdt_amount=alloc,
                     current_price=coin["mid_price"],
                     direction=coin["direction"],
+                    order_priority=order_priority,
                 )
 
                 if result["success"]:
                     fees = self._calc_fees(alloc)
-                    self.positions.record_open(
+                    pos_id = self.positions.record_open(
                         symbol=coin["binance_symbol"],
                         direction=coin["direction"],
                         quantity=result["quantity"],
@@ -167,7 +197,25 @@ class FundingArbitrageBot:
                         usdt_amount=alloc,
                         slippage=result["slippage"],
                         fees_paid=fees,
+                        open_basis=open_basis,
                     )
+
+                    # 记录两条腿的成交明细
+                    spot_side = "BUY" if coin["direction"] == "positive" else "SELL"
+                    futures_side = "SELL" if coin["direction"] == "positive" else "BUY"
+                    spot_fee = alloc * self.fees_cfg["spot_taker"]
+                    futures_fee = alloc * self.fees_cfg["futures_taker"]
+                    self.positions.record_trade(
+                        pos_id, "open", spot_side, "spot",
+                        coin["binance_symbol"], result["quantity"],
+                        result["spot_avg_price"], spot_fee, result.get("spot"),
+                    )
+                    self.positions.record_trade(
+                        pos_id, "open", futures_side, "futures",
+                        coin["binance_symbol"], result["quantity"],
+                        result["futures_avg_price"], futures_fee, result.get("futures"),
+                    )
+
                     if self.notifier:
                         await self.notifier.on_open(
                             coin["binance_symbol"], coin["direction"],
@@ -184,6 +232,11 @@ class FundingArbitrageBot:
 
         except Exception as e:
             logger.exception(f"扫描异常: {e}")
+            if self.notifier:
+                try:
+                    await self.notifier.on_error(f"扫描开仓异常: {e}")
+                except Exception:
+                    pass
 
     # ==================================================================
     # 模拟 / 实盘：持仓检查→平仓
@@ -194,6 +247,7 @@ class FundingArbitrageBot:
                 symbol = pos["symbol"]
                 ccxt_sym = _to_ccxt(symbol)
                 tier = classify(ccxt_sym)
+                ticker = None  # 本次迭代的 ticker 缓存，避免重复请求
 
                 should_close, reason = await self.monitor.should_exit(
                     ccxt_sym, pos["direction"]
@@ -216,18 +270,87 @@ class FundingArbitrageBot:
                         should_close, reason = True, "T2 流动性下降"
 
                 if should_close:
+                    # 获取基差（同时提供当前价格，减少一次 API 调用）
+                    basis_data = await self.monitor.fetch_basis(ccxt_sym)
+                    close_basis = basis_data["basis_pct"] if basis_data else None
+                    if basis_data:
+                        current_price = basis_data["perp_price"]
+                    elif ticker and ticker.get("last"):
+                        current_price = float(ticker["last"])
+                    else:
+                        if ticker is None:
+                            ticker = await self.monitor.get_ticker(ccxt_sym)
+                        current_price = float(ticker["last"]) if ticker and ticker.get("last") else None
+
                     result = self.executor.close_arbitrage(
-                        symbol, pos["quantity"], pos["direction"]
+                        symbol, pos["quantity"], pos["direction"],
+                        current_price=current_price,
+                        usdt_amount=pos["usdt_amount"],
                     )
                     if result["success"]:
+                        # 计算价格盈亏（对冲组合中的基差变化）
+                        close_spot = result.get("spot_avg_price", 0)
+                        close_futures = result.get("futures_avg_price", 0)
+                        if close_spot and close_futures:
+                            if pos["direction"] == "positive":
+                                # 现货多 + 合约空：现货涨赚，合约跌赚
+                                close_pnl = (
+                                    (close_spot - pos["spot_price"])
+                                    + (pos["futures_price"] - close_futures)
+                                ) * pos["quantity"]
+                            else:
+                                # 现货空 + 合约多：现货跌赚，合约涨赚
+                                close_pnl = (
+                                    (pos["spot_price"] - close_spot)
+                                    + (close_futures - pos["futures_price"])
+                                ) * pos["quantity"]
+                        else:
+                            close_pnl = 0
+
                         fees = self._calc_fees(pos["usdt_amount"])
                         rebate = (pos["fees_paid"] + fees) * self.fees_cfg["rebate_rate"]
-                        self.positions.record_close(pos["id"], 0, fees, rebate)
+                        self.positions.record_close(pos["id"], close_pnl, fees, rebate, close_basis)
+
+                        # 记录平仓两条腿的成交明细
+                        close_spot_side = "SELL" if pos["direction"] == "positive" else "BUY"
+                        close_futures_side = "BUY" if pos["direction"] == "positive" else "SELL"
+                        spot_fee = pos["usdt_amount"] * self.fees_cfg["spot_taker"]
+                        futures_fee = pos["usdt_amount"] * self.fees_cfg["futures_taker"]
+                        self.positions.record_trade(
+                            pos["id"], "close", close_spot_side, "spot",
+                            symbol, pos["quantity"], close_spot, spot_fee,
+                            result.get("spot"),
+                        )
+                        self.positions.record_trade(
+                            pos["id"], "close", close_futures_side, "futures",
+                            symbol, pos["quantity"], close_futures, futures_fee,
+                            result.get("futures"),
+                        )
+
                         tag = "[模拟]" if self.mode == "simulate" else "[实盘]"
-                        logger.info(f"{tag} 平仓 {symbol}: {reason}")
+                        logger.info(
+                            f"{tag} 平仓 {symbol}: {reason} | "
+                            f"价格盈亏 ${close_pnl:+.4f}"
+                        )
+
+                        if self.notifier:
+                            total_fees = pos["fees_paid"] + fees
+                            net_pnl = pos["funding_earned"] + close_pnl - total_fees + rebate
+                            try:
+                                await self.notifier.on_close(
+                                    symbol, pos["funding_earned"],
+                                    total_fees, rebate, net_pnl, reason,
+                                )
+                            except Exception:
+                                pass
 
         except Exception as e:
             logger.exception(f"持仓检查异常: {e}")
+            if self.notifier:
+                try:
+                    await self.notifier.on_error(f"持仓检查异常: {e}")
+                except Exception:
+                    pass
 
     # ==================================================================
     # 费率结算（模拟和实盘共用）
@@ -247,8 +370,23 @@ class FundingArbitrageBot:
                     f"{tag} 费率到账 {pos['symbol']} | "
                     f"{rate:+.4%} | ${payment:+.4f}"
                 )
+
+                if self.notifier:
+                    try:
+                        await self.notifier.on_funding(
+                            pos["symbol"], rate, payment,
+                            pos["funding_earned"] + payment,
+                        )
+                    except Exception:
+                        pass
+
         except Exception as e:
             logger.exception(f"费率记录异常: {e}")
+            if self.notifier:
+                try:
+                    await self.notifier.on_error(f"费率记录异常: {e}")
+                except Exception:
+                    pass
 
     # ==================================================================
     async def task_daily_report(self):
@@ -267,9 +405,21 @@ class FundingArbitrageBot:
                 await self.notifier.on_daily_report(summary)
         except Exception as e:
             logger.exception(f"日报异常: {e}")
+            if self.notifier:
+                try:
+                    await self.notifier.on_error(f"日报异常: {e}")
+                except Exception:
+                    pass
 
     def _calc_fees(self, amount):
-        return amount * (self.fees_cfg["spot_taker"] + self.fees_cfg["futures_taker"])
+        """计算手续费，支持 BNB 抵扣折扣"""
+        if self.fees_cfg.get("use_bnb_discount", False):
+            spot_rate = self.fees_cfg.get("spot_taker_bnb", self.fees_cfg["spot_taker"])
+            futures_rate = self.fees_cfg.get("futures_taker_bnb", self.fees_cfg["futures_taker"])
+        else:
+            spot_rate = self.fees_cfg["spot_taker"]
+            futures_rate = self.fees_cfg["futures_taker"]
+        return amount * (spot_rate + futures_rate)
 
     # ==================================================================
     async def run(self):

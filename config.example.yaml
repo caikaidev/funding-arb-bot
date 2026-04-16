@@ -62,10 +62,14 @@ strategy:
     - "BTCUSDT"
     - "ETHUSDT"
 
+  # 开仓顺序: "concurrent"（并发，默认）| "futures_first"（合约先行，推荐）
+  order_priority: "futures_first"
+
   entry:
     min_funding_rate: 0.0002
     min_annualized: 0.15
     max_spread_pct: 0.001
+    max_basis_pct: 0.001          # 基差超过 0.1% 时暂缓开仓
 
   exit:
     rate_reverse_count: 3
@@ -86,6 +90,21 @@ fees:
   futures_taker: 0.0004
   futures_maker: 0.0002
   rebate_rate: 0.30
+
+  # BNB 手续费抵扣（使用 BNB 支付手续费享受 25% 折扣）
+  use_bnb_discount: true
+  spot_taker_bnb: 0.00075         # BNB 抵扣后现货 Taker: 0.10% → 0.075%
+  futures_taker_bnb: 0.00036      # BNB 抵扣后合约 Taker: 0.04% → 0.036%
+  bnb_min_balance: 0.05           # BNB 低于此值时发 Telegram 告警
+
+# --------------------------------------------------
+# 分批下单阈值（超出后自动拆单，防大额滑点）
+# --------------------------------------------------
+split_thresholds:
+  BTCUSDT: 20000
+  ETHUSDT: 15000
+  SOLUSDT: 8000
+  default: 5000                   # 其余币种默认阈值
 
 # --------------------------------------------------
 # 通知 & 调度

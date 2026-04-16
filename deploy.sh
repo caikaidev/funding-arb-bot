@@ -78,12 +78,12 @@ echo "📦 Step 2: 安装依赖"
 
 cd "$PROJECT_DIR"
 
-if [ ! -d "venv" ]; then
-    $PYTHON_BIN -m venv venv
+if [ ! -d ".venv" ]; then
+    $PYTHON_BIN -m venv .venv
     info "虚拟环境已创建"
 fi
 
-source venv/bin/activate
+source .venv/bin/activate
 pip install --quiet --upgrade pip
 pip install --quiet -r requirements.txt
 info "依赖安装完成"
@@ -125,7 +125,11 @@ print(c.get('initial_capital', 10000))
 # ------------------------------------------------------------------
 echo "⚙️  Step 4: 配置后台服务"
 
-VENV_PYTHON="$PROJECT_DIR/venv/bin/python"
+# 确保日志目录存在
+mkdir -p "${PROJECT_DIR}/logs"
+info "日志目录已就绪"
+
+VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
 
 sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null << EOF
 [Unit]
@@ -190,7 +194,7 @@ echo "  ────────────────────────
 echo "  查看状态    sudo systemctl status ${SERVICE_NAME}"
 echo "  查看日志    tail -f ${PROJECT_DIR}/logs/service.log"
 echo "  实时日志    journalctl -u ${SERVICE_NAME} -f"
-echo "  查看结果    cd ${PROJECT_DIR} && source venv/bin/activate && python results.py"
+echo "  查看结果    cd ${PROJECT_DIR} && source .venv/bin/activate && python results.py"
 echo "  导出 CSV    python results.py --export"
 echo "  停止服务    sudo systemctl stop ${SERVICE_NAME}"
 echo "  重启服务    sudo systemctl restart ${SERVICE_NAME}"

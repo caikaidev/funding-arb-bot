@@ -15,8 +15,10 @@ from binance.spot import Spot
 from binance.um_futures import UMFutures
 from binance.error import ClientError, ServerError
 
+from base_executor import BaseExecutor
 
-class BinanceExecutor:
+
+class BinanceExecutor(BaseExecutor):
     """
     Binance 官方 SDK 下单器
     - 现货: binance-connector (Spot)
@@ -46,6 +48,7 @@ class BinanceExecutor:
         self.futures = UMFutures(**futures_kwargs)
         self.fees = config["fees"]
         self.max_slippage = config["strategy"]["risk"]["max_slippage"]
+        self.split_thresholds = config.get("split_thresholds", {})
 
         # 缓存交易精度
         self._precision_cache = {}
@@ -99,7 +102,7 @@ class BinanceExecutor:
             return str(d.quantize(Decimal(10) ** -p, rounding=ROUND_DOWN))
 
     # ------------------------------------------------------------------
-    # 核心：原子化开仓
+    # 核心：原子化开仓（含分批 + 下单顺序支持）
     # ------------------------------------------------------------------
     def open_arbitrage(
         self,
@@ -107,20 +110,67 @@ class BinanceExecutor:
         usdt_amount: float,
         current_price: float,
         direction: str = "positive",
+        order_priority: str = "concurrent",
     ) -> dict:
         """
-        原子化开仓：并发执行现货+合约
+        原子化开仓，大额自动分批
 
         Args:
-            symbol: 'BTCUSDT'
-            usdt_amount: 投入金额 (USDT)
-            current_price: 当前价格（由 monitor 提供）
-            direction: 'positive' = 现货买+合约空 | 'reverse' = 现货卖+合约多
-
-        Returns:
-            {'success': bool, 'spot': {}, 'futures': {}, 'slippage': float}
+            order_priority: 'concurrent'（并发）| 'futures_first'（合约先行，推荐）
         """
-        # 1. 计算下单数量
+        chunks = self._split_order(symbol, usdt_amount)
+
+        if len(chunks) == 1:
+            return self._open_single(symbol, chunks[0], current_price, direction, order_priority)
+
+        logger.info(f"大额开仓分 {len(chunks)} 批执行: {symbol} ${usdt_amount:.0f}")
+        successful = []
+        total_qty = 0.0
+        weighted_spot = 0.0
+        weighted_futures = 0.0
+
+        for i, chunk_usdt in enumerate(chunks):
+            if i > 0:
+                time.sleep(0.5)
+            r = self._open_single(symbol, chunk_usdt, current_price, direction, order_priority)
+            if r["success"]:
+                q = r["quantity"]
+                successful.append(r)
+                total_qty += q
+                weighted_spot += r["spot_avg_price"] * q
+                weighted_futures += r["futures_avg_price"] * q
+            else:
+                logger.warning(f"第 {i + 1}/{len(chunks)} 批开仓失败: {r.get('error')}")
+                if not successful:
+                    return r  # 首批即失败，直接返回
+                break  # 已有成功批次，保留为较小仓位
+
+        if not successful:
+            return {"success": False, "error": "all_chunks_failed"}
+
+        partial = len(successful) < len(chunks)
+        if partial:
+            logger.warning(f"部分开仓: {symbol} 完成 {len(successful)}/{len(chunks)} 批")
+
+        return {
+            "success": True,
+            "spot_avg_price": weighted_spot / total_qty,
+            "futures_avg_price": weighted_futures / total_qty,
+            "quantity": total_qty,
+            "slippage": sum(r["slippage"] for r in successful) / len(successful),
+            "chunks": len(successful),
+            "partial": partial,
+        }
+
+    def _open_single(
+        self,
+        symbol: str,
+        usdt_amount: float,
+        current_price: float,
+        direction: str,
+        order_priority: str,
+    ) -> dict:
+        """执行单批开仓（内部方法，不含分批逻辑）"""
         raw_qty = usdt_amount / current_price
         quantity = self._round_qty(raw_qty, symbol)
         qty_float = float(quantity)
@@ -133,143 +183,202 @@ class BinanceExecutor:
             }
 
         logger.info(
-            f"准备开仓: {symbol} | "
-            f"价格: {current_price} | "
-            f"数量: {quantity} | "
-            f"金额: ${usdt_amount:.2f} | "
-            f"方向: {direction}"
+            f"准备开仓: {symbol} | 价格: {current_price} | "
+            f"数量: {quantity} | 金额: ${usdt_amount:.2f} | "
+            f"方向: {direction} | 模式: {order_priority}"
         )
 
-        # 2. 定义两条腿的下单函数
         def exec_spot():
-            if direction == "positive":
-                return self.spot.new_order(
-                    symbol=symbol,
-                    side="BUY",
-                    type="MARKET",
-                    quantity=quantity,
-                )
-            else:
-                return self.spot.new_order(
-                    symbol=symbol,
-                    side="SELL",
-                    type="MARKET",
-                    quantity=quantity,
-                )
+            return self.spot.new_order(
+                symbol=symbol,
+                side="BUY" if direction == "positive" else "SELL",
+                type="MARKET",
+                quantity=quantity,
+            )
 
         def exec_futures():
-            if direction == "positive":
-                return self.futures.new_order(
-                    symbol=symbol,
-                    side="SELL",
-                    type="MARKET",
-                    quantity=quantity,
-                )
-            else:
-                return self.futures.new_order(
-                    symbol=symbol,
-                    side="BUY",
-                    type="MARKET",
-                    quantity=quantity,
-                )
+            return self.futures.new_order(
+                symbol=symbol,
+                side="SELL" if direction == "positive" else "BUY",
+                type="MARKET",
+                quantity=quantity,
+            )
 
-        # 3. 并发执行（ThreadPoolExecutor）
         spot_result = None
         futures_result = None
         spot_error = None
         futures_error = None
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            spot_future = pool.submit(exec_spot)
-            futures_future = pool.submit(exec_futures)
-
-            # 等待结果
+        if order_priority == "futures_first":
+            # 合约先行：顺序执行，降低持仓不对称风险
             try:
-                spot_result = spot_future.result(timeout=10)
-            except Exception as e:
-                spot_error = e
-
-            try:
-                futures_result = futures_future.result(timeout=10)
+                futures_result = exec_futures()
             except Exception as e:
                 futures_error = e
 
-        # 4. 处理结果
-        spot_ok = spot_result is not None and spot_error is None
-        futures_ok = futures_result is not None and futures_error is None
+            if futures_error:
+                logger.error(f"合约先行下单失败: {futures_error}")
+                return {"success": False, "error": f"futures_failed: {futures_error}"}
 
-        if spot_ok and futures_ok:
-            # 两边都成功 → 计算滑点
-            spot_avg = self._calc_avg_price(spot_result)
-            futures_avg = self._calc_avg_price(futures_result)
-            slippage = abs(spot_avg - futures_avg) / current_price
+            try:
+                spot_result = exec_spot()
+            except Exception as e:
+                spot_error = e
 
-            logger.success(
-                f"开仓成功: {symbol} | "
-                f"现货成交: {spot_avg:.2f} | "
-                f"合约成交: {futures_avg:.2f} | "
-                f"滑点: {slippage:.4%}"
-            )
+            if spot_error:
+                logger.error(f"合约已成交，现货下单失败: {spot_error}，回滚合约...")
+                self._rollback_futures(symbol, quantity, direction)
+                return {"success": False, "error": f"spot_failed: {spot_error}", "rolled_back": True}
 
-            if slippage > self.max_slippage:
-                logger.warning(f"滑点 {slippage:.4%} 超过阈值 {self.max_slippage:.2%}")
+        else:
+            # 并发模式（默认）
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                spot_future = pool.submit(exec_spot)
+                futures_future = pool.submit(exec_futures)
 
-            return {
-                "success": True,
-                "spot": spot_result,
-                "futures": futures_result,
-                "spot_avg_price": spot_avg,
-                "futures_avg_price": futures_avg,
-                "quantity": qty_float,
-                "slippage": slippage,
-            }
+                try:
+                    spot_result = spot_future.result(timeout=10)
+                except Exception as e:
+                    spot_error = e
 
-        # 单边失败 → 回滚
-        if spot_ok and not futures_ok:
-            logger.error(f"合约下单失败: {futures_error}，回滚现货...")
-            self._rollback_spot(symbol, quantity, direction)
-            return {"success": False, "error": f"futures_failed: {futures_error}", "rolled_back": True}
+                try:
+                    futures_result = futures_future.result(timeout=10)
+                except Exception as e:
+                    futures_error = e
 
-        if not spot_ok and futures_ok:
-            logger.error(f"现货下单失败: {spot_error}，回滚合约...")
-            self._rollback_futures(symbol, quantity, direction)
-            return {"success": False, "error": f"spot_failed: {spot_error}", "rolled_back": True}
+            spot_ok = spot_result is not None and spot_error is None
+            futures_ok = futures_result is not None and futures_error is None
 
-        # 双边失败
-        logger.error(f"双边失败! 现货: {spot_error} | 合约: {futures_error}")
-        return {"success": False, "error": "both_failed"}
+            if not spot_ok and not futures_ok:
+                logger.error(f"双边失败! 现货: {spot_error} | 合约: {futures_error}")
+                return {"success": False, "error": "both_failed"}
+
+            if spot_ok and not futures_ok:
+                logger.error(f"合约下单失败: {futures_error}，回滚现货...")
+                self._rollback_spot(symbol, quantity, direction)
+                return {"success": False, "error": f"futures_failed: {futures_error}", "rolled_back": True}
+
+            if not spot_ok and futures_ok:
+                logger.error(f"现货下单失败: {spot_error}，回滚合约...")
+                self._rollback_futures(symbol, quantity, direction)
+                return {"success": False, "error": f"spot_failed: {spot_error}", "rolled_back": True}
+
+        # 两边都成功 → 计算滑点
+        spot_avg = self._calc_avg_price(spot_result)
+        futures_avg = self._calc_avg_price(futures_result)
+        slippage = abs(spot_avg - futures_avg) / current_price
+
+        logger.success(
+            f"开仓成功: {symbol} | "
+            f"现货成交: {spot_avg:.2f} | "
+            f"合约成交: {futures_avg:.2f} | "
+            f"滑点: {slippage:.4%}"
+        )
+        if slippage > self.max_slippage:
+            logger.warning(f"滑点 {slippage:.4%} 超过阈值 {self.max_slippage:.2%}")
+
+        return {
+            "success": True,
+            "spot": spot_result,
+            "futures": futures_result,
+            "spot_avg_price": spot_avg,
+            "futures_avg_price": futures_avg,
+            "quantity": qty_float,
+            "slippage": slippage,
+        }
 
     # ------------------------------------------------------------------
-    # 平仓
+    # 平仓（含分批支持）
     # ------------------------------------------------------------------
     def close_arbitrage(
         self,
         symbol: str,
         quantity: float,
         direction: str = "positive",
+        current_price: float = None,
+        usdt_amount: float = None,
     ) -> dict:
         """
-        平仓：方向与开仓相反
-        positive 开仓 = 现货买+合约空 → 平仓 = 现货卖+合约买
-        """
-        qty_str = self._round_qty(quantity, symbol)
+        平仓：方向与开仓相反，大额自动分批
+        positive: 现货卖 + 合约买回
+        reverse:  现货买回 + 合约卖
 
+        Args:
+            current_price: 当前市价（BinanceExecutor 忽略，由实际成交价决定）
+            usdt_amount: 开仓时的 USDT 金额，用于判断是否需要分批
+        """
+        if usdt_amount:
+            chunks_usdt = self._split_order(symbol, usdt_amount)
+            if len(chunks_usdt) > 1:
+                chunks_qty = [quantity * (c / usdt_amount) for c in chunks_usdt]
+            else:
+                chunks_qty = [quantity]
+        else:
+            chunks_qty = [quantity]
+
+        if len(chunks_qty) == 1:
+            return self._close_single(symbol, chunks_qty[0], direction, current_price)
+
+        logger.info(f"大额平仓分 {len(chunks_qty)} 批执行: {symbol}")
+        successful = []
+        total_qty = 0.0
+        weighted_spot = 0.0
+        weighted_futures = 0.0
+
+        for i, chunk_qty in enumerate(chunks_qty):
+            if i > 0:
+                time.sleep(0.5)
+            r = self._close_single(symbol, chunk_qty, direction, current_price)
+            if r["success"]:
+                q_done = float(self._round_qty(chunk_qty, symbol))
+                successful.append(r)
+                total_qty += q_done
+                weighted_spot += r["spot_avg_price"] * q_done
+                weighted_futures += r["futures_avg_price"] * q_done
+            else:
+                logger.warning(f"第 {i + 1}/{len(chunks_qty)} 批平仓失败: {r.get('error')}")
+                if not successful:
+                    return r
+                break
+
+        if not successful:
+            return {"success": False, "error": "all_chunks_failed"}
+
+        partial = len(successful) < len(chunks_qty)
+        if partial:
+            logger.warning(f"部分平仓: {symbol} 完成 {len(successful)}/{len(chunks_qty)} 批")
+
+        return {
+            "success": True,
+            "spot_avg_price": weighted_spot / total_qty,
+            "futures_avg_price": weighted_futures / total_qty,
+            "chunks": len(successful),
+            "partial": partial,
+        }
+
+    def _close_single(
+        self,
+        symbol: str,
+        quantity: float,
+        direction: str,
+        current_price: float = None,
+    ) -> dict:
+        """执行单批平仓（内部方法，current_price 由实际成交价决定，此参数仅保留接口一致性）"""
+        qty_str = self._round_qty(quantity, symbol)
         logger.info(f"准备平仓: {symbol} | 数量: {qty_str} | 方向: {direction}")
 
         def exec_spot_close():
-            side = "SELL" if direction == "positive" else "BUY"
             return self.spot.new_order(
                 symbol=symbol,
-                side=side,
+                side="SELL" if direction == "positive" else "BUY",
                 type="MARKET",
                 quantity=qty_str,
             )
 
         def exec_futures_close():
-            side = "BUY" if direction == "positive" else "SELL"
             return self.futures.new_order(
                 symbol=symbol,
-                side=side,
+                side="BUY" if direction == "positive" else "SELL",
                 type="MARKET",
                 quantity=qty_str,
                 reduceOnly=True,
@@ -282,15 +391,20 @@ class BinanceExecutor:
             try:
                 spot_result = sf.result(timeout=10)
                 futures_result = ff.result(timeout=10)
-                logger.success(f"平仓成功: {symbol}")
-                return {
-                    "success": True,
-                    "spot": spot_result,
-                    "futures": futures_result,
-                }
             except Exception as e:
                 logger.error(f"平仓异常: {e}")
                 return {"success": False, "error": str(e)}
+
+        spot_avg = self._calc_avg_price(spot_result)
+        futures_avg = self._calc_avg_price(futures_result)
+        logger.success(f"平仓成功: {symbol} | 现货: {spot_avg:.4f} | 合约: {futures_avg:.4f}")
+        return {
+            "success": True,
+            "spot": spot_result,
+            "futures": futures_result,
+            "spot_avg_price": spot_avg,
+            "futures_avg_price": futures_avg,
+        }
 
     # ------------------------------------------------------------------
     # 回滚 & 工具
@@ -334,6 +448,18 @@ class BinanceExecutor:
     # ------------------------------------------------------------------
     # 账户查询
     # ------------------------------------------------------------------
+    def check_bnb_balance(self) -> float:
+        """查询 BNB 现货余额（用于手续费抵扣检查）"""
+        try:
+            info = self.spot.account()
+            for b in info["balances"]:
+                if b["asset"] == "BNB":
+                    return float(b["free"])
+            return 0.0
+        except Exception as e:
+            logger.error(f"查询 BNB 余额失败: {e}")
+            return 0.0
+
     def get_spot_balance(self, asset: str = "USDT") -> float:
         """查询现货余额"""
         try:
