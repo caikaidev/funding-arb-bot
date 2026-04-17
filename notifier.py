@@ -1,6 +1,8 @@
 """
 Telegram 通知模块 — 手机实时接收开仓/平仓/异常告警
 """
+import os
+import traceback
 import aiohttp
 from loguru import logger
 
@@ -81,8 +83,27 @@ class TelegramNotifier:
             f"累计: `${total_earned:+.4f}`"
         )
 
-    async def on_error(self, message):
-        await self.send(f"*异常告警*\n{message}", urgent=True)
+    async def on_error(self, message, exc: BaseException | None = None):
+        text = f"*异常告警*\n{message}"
+        if exc is not None:
+            tb = exc.__traceback__
+            frames = traceback.extract_tb(tb) if tb else []
+            # 取最后一帧业务代码（跳过 site-packages / 标准库）；退而取最后一帧
+            frame = next(
+                (f for f in reversed(frames) if "site-packages" not in f.filename),
+                frames[-1] if frames else None,
+            )
+            text += f"\n类型: `{type(exc).__name__}`"
+            if frame is not None:
+                fname = os.path.basename(frame.filename)
+                text += f"\n位置: `{fname}:{frame.lineno}` in `{frame.name}`"
+                if frame.line:
+                    # 反引号会破坏 Markdown code span
+                    src = frame.line.strip().replace("`", "'")
+                    if len(src) > 120:
+                        src = src[:117] + "..."
+                    text += f"\n代码: `{src}`"
+        await self.send(text, urgent=True)
 
     async def on_daily_report(self, summary: dict):
         await self.send(

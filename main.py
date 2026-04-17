@@ -234,7 +234,7 @@ class FundingArbitrageBot:
             logger.exception(f"扫描异常: {e}")
             if self.notifier:
                 try:
-                    await self.notifier.on_error(f"扫描开仓异常: {e}")
+                    await self.notifier.on_error(f"扫描开仓异常: {e}", exc=e)
                 except Exception:
                     pass
 
@@ -348,7 +348,7 @@ class FundingArbitrageBot:
             logger.exception(f"持仓检查异常: {e}")
             if self.notifier:
                 try:
-                    await self.notifier.on_error(f"持仓检查异常: {e}")
+                    await self.notifier.on_error(f"持仓检查异常: {e}", exc=e)
                 except Exception:
                     pass
 
@@ -384,7 +384,7 @@ class FundingArbitrageBot:
             logger.exception(f"费率记录异常: {e}")
             if self.notifier:
                 try:
-                    await self.notifier.on_error(f"费率记录异常: {e}")
+                    await self.notifier.on_error(f"费率记录异常: {e}", exc=e)
                 except Exception:
                     pass
 
@@ -407,7 +407,7 @@ class FundingArbitrageBot:
             logger.exception(f"日报异常: {e}")
             if self.notifier:
                 try:
-                    await self.notifier.on_error(f"日报异常: {e}")
+                    await self.notifier.on_error(f"日报异常: {e}", exc=e)
                 except Exception:
                     pass
 

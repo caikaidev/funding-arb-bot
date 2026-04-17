@@ -201,12 +201,12 @@ class PositionManager:
         """汇总统计"""
         row = self.conn.execute("""
             SELECT
-                COUNT(*)                                           AS total_trades,
-                SUM(CASE WHEN status='open' THEN 1 ELSE 0 END)    AS open_trades,
-                SUM(funding_earned)                                AS total_funding,
-                SUM(fees_paid)                                     AS total_fees,
-                SUM(fees_rebated)                                  AS total_rebate,
-                SUM(net_pnl)                                       AS total_net_pnl
+                COUNT(*)                                                    AS total_trades,
+                COALESCE(SUM(CASE WHEN status='open' THEN 1 ELSE 0 END), 0) AS open_trades,
+                COALESCE(SUM(funding_earned), 0)                            AS total_funding,
+                COALESCE(SUM(fees_paid), 0)                                 AS total_fees,
+                COALESCE(SUM(fees_rebated), 0)                              AS total_rebate,
+                COALESCE(SUM(net_pnl), 0)                                   AS total_net_pnl
             FROM positions
         """).fetchone()
         return dict(row) if row else {}
