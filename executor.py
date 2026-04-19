@@ -54,6 +54,18 @@ class BinanceExecutor(BaseExecutor):
         self._precision_cache = {}
 
     # ------------------------------------------------------------------
+    # 精度 & 成交校验
+    # ------------------------------------------------------------------
+    def _check_fill(self, result: dict, requested_qty: str) -> None:
+        """验证市价单实际成交量，不足请求量 99% 视为失败（部分成交保护）"""
+        executed = float(result.get("executedQty") or result.get("cumQty", 0))
+        requested = float(requested_qty)
+        if requested > 0 and executed < requested * 0.99:
+            raise ValueError(
+                f"部分成交: 请求 {requested}, 实际 {executed:.6f} ({executed/requested:.1%})"
+            )
+
+    # ------------------------------------------------------------------
     # 精度处理
     # ------------------------------------------------------------------
     def _get_precision(self, symbol: str) -> dict:
@@ -220,6 +232,13 @@ class BinanceExecutor(BaseExecutor):
                 logger.error(f"合约先行下单失败: {futures_error}")
                 return {"success": False, "error": f"futures_failed: {futures_error}"}
 
+            # 校验合约成交量
+            try:
+                self._check_fill(futures_result, quantity)
+            except ValueError as e:
+                logger.error(f"合约部分成交，不开现货: {e}")
+                return {"success": False, "error": f"futures_partial_fill: {e}"}
+
             try:
                 spot_result = exec_spot()
             except Exception as e:
@@ -229,6 +248,14 @@ class BinanceExecutor(BaseExecutor):
                 logger.error(f"合约已成交，现货下单失败: {spot_error}，回滚合约...")
                 self._rollback_futures(symbol, quantity, direction)
                 return {"success": False, "error": f"spot_failed: {spot_error}", "rolled_back": True}
+
+            # 校验现货成交量
+            try:
+                self._check_fill(spot_result, quantity)
+            except ValueError as e:
+                logger.error(f"现货部分成交: {e}，回滚合约...")
+                self._rollback_futures(symbol, quantity, direction)
+                return {"success": False, "error": f"spot_partial_fill: {e}", "rolled_back": True}
 
         else:
             # 并发模式（默认）
@@ -263,10 +290,27 @@ class BinanceExecutor(BaseExecutor):
                 self._rollback_futures(symbol, quantity, direction)
                 return {"success": False, "error": f"spot_failed: {spot_error}", "rolled_back": True}
 
+            # 两边都有返回：校验成交量
+            try:
+                self._check_fill(spot_result, quantity)
+                self._check_fill(futures_result, quantity)
+            except ValueError as e:
+                logger.error(f"成交量不足，回滚两腿: {e}")
+                self._rollback_spot(symbol, quantity, direction)
+                self._rollback_futures(symbol, quantity, direction)
+                return {"success": False, "error": f"partial_fill: {e}", "rolled_back": True}
+
         # 两边都成功 → 计算滑点
         spot_avg = self._calc_avg_price(spot_result)
         futures_avg = self._calc_avg_price(futures_result)
         slippage = abs(spot_avg - futures_avg) / current_price
+
+        # 滑点超标：立即回滚两腿，不记录仓位
+        if slippage > self.max_slippage:
+            logger.error(f"滑点 {slippage:.4%} 超过阈值 {self.max_slippage:.2%}，立即回滚两腿")
+            self._rollback_spot(symbol, quantity, direction)
+            self._rollback_futures(symbol, quantity, direction)
+            return {"success": False, "error": f"slippage_exceeded: {slippage:.4%}", "rolled_back": True}
 
         logger.success(
             f"开仓成功: {symbol} | "
@@ -274,8 +318,6 @@ class BinanceExecutor(BaseExecutor):
             f"合约成交: {futures_avg:.2f} | "
             f"滑点: {slippage:.4%}"
         )
-        if slippage > self.max_slippage:
-            logger.warning(f"滑点 {slippage:.4%} 超过阈值 {self.max_slippage:.2%}")
 
         return {
             "success": True,

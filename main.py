@@ -84,6 +84,30 @@ class FundingArbitrageBot:
         else:
             self.notifier = None
 
+        # 账实对账器（仅实盘，simulate 无需）
+        self.reconciler = None
+        if mode == "live":
+            from reconciler import Reconciler
+            self.reconciler = Reconciler(self.executor, self.positions, self.notifier)
+
+    # ==================================================================
+    # 守卫方法
+    # ==================================================================
+    @staticmethod
+    def _in_settlement_window() -> bool:
+        """检查是否处于 8h 结算封锁窗口 (HH:59:30 – HH:00:30 UTC)"""
+        now = datetime.now(timezone.utc)
+        m, s = now.minute, now.second
+        return (m == 59 and s >= 30) or (m == 0 and s <= 30)
+
+    def _passes_break_even(self, coin: dict, alloc: float) -> bool:
+        """预期回本检查：min_holding_hours 内累计资金费 ≥ 双程手续费 × 1.5"""
+        rate = abs(coin["rate"])
+        min_hold = self.config["strategy"]["exit"].get("min_holding_hours", 24)
+        expected_funding = alloc * rate * (min_hold / 8)
+        two_way_fee = self._calc_fees(alloc) * 2
+        return expected_funding >= two_way_fee * 1.5
+
     # ==================================================================
     # 监控模式
     # ==================================================================
@@ -128,6 +152,11 @@ class FundingArbitrageBot:
     # ==================================================================
     async def task_scan_and_open(self):
         try:
+            # 结算窗口封锁
+            if self._in_settlement_window():
+                logger.debug("处于结算窗口，跳过本次开仓扫描")
+                return
+
             qualified = await self.screener.screen()
             if not qualified:
                 return
@@ -140,19 +169,44 @@ class FundingArbitrageBot:
                 logger.info(f"可用不足 ${available:.0f}")
                 return
 
-            # BNB 余额检查（每次扫描检查一次）
+            # 日亏损上限检查
+            daily_pnl = self.positions.get_daily_pnl()
+            if daily_pnl < -self.plan.daily_loss_limit:
+                logger.warning(
+                    f"触发日亏损上限: 今日盈亏 ${daily_pnl:.2f} < "
+                    f"-${self.plan.daily_loss_limit:.2f}，今日停止开新仓"
+                )
+                if self.notifier:
+                    try:
+                        await self.notifier.on_error(
+                            f"触发日亏损上限 ${daily_pnl:.2f}，今日不再开新仓"
+                        )
+                    except Exception:
+                        pass
+                return
+
+            # 账实一致性检查
+            if self.reconciler and not self.reconciler.is_clean:
+                logger.warning("账实不符（对账未通过），跳过开仓")
+                return
+
+            # BNB 余额检查 — 不足时硬停本次开仓
             if self.fees_cfg.get("use_bnb_discount", False):
                 bnb_balance = self.executor.check_bnb_balance()
                 bnb_min = self.fees_cfg.get("bnb_min_balance", 0.05)
                 if bnb_balance < bnb_min:
-                    logger.warning(f"BNB 余额不足: {bnb_balance:.4f} BNB < {bnb_min} BNB，请及时补充")
+                    logger.error(
+                        f"BNB 余额不足 ({bnb_balance:.4f} < {bnb_min} BNB)，"
+                        f"本次停止开仓（手续费无折扣将超过收益）"
+                    )
                     if self.notifier:
                         try:
                             await self.notifier.on_error(
-                                f"BNB 余额不足 {bnb_balance:.4f} BNB（建议 >{bnb_min}），手续费折扣可能失效"
+                                f"BNB 余额不足 {bnb_balance:.4f} BNB（建议 >{bnb_min}），已停止本次开仓"
                             )
                         except Exception:
                             pass
+                    return
 
             order_priority = self.config["strategy"].get("order_priority", "concurrent")
             max_basis = self.config["strategy"]["entry"].get("max_basis_pct", 0.001)
@@ -163,6 +217,14 @@ class FundingArbitrageBot:
                     continue
                 alloc = min(alloc, available)
                 if alloc < 200:
+                    continue
+
+                # 预期回本检查：当前费率在最短持仓期内能否覆盖双程手续费
+                if not self._passes_break_even(coin, alloc):
+                    logger.info(
+                        f"跳过 {coin['binance_symbol']}: 费率 {coin['rate']:.4%} "
+                        f"不足以覆盖手续费（min_holding_hours 内预期收益 < 双程费 ×1.5）"
+                    )
                     continue
 
                 # 基差检查：基差过大时暂缓开仓，等待收敛
@@ -243,6 +305,11 @@ class FundingArbitrageBot:
     # ==================================================================
     async def task_check_and_close(self):
         try:
+            # 结算窗口封锁
+            if self._in_settlement_window():
+                logger.debug("处于结算窗口，跳过本次持仓检查")
+                return
+
             for pos in self.positions.get_open_positions():
                 symbol = pos["symbol"]
                 ccxt_sym = _to_ccxt(symbol)
@@ -250,7 +317,7 @@ class FundingArbitrageBot:
                 ticker = None  # 本次迭代的 ticker 缓存，避免重复请求
 
                 should_close, reason = await self.monitor.should_exit(
-                    ccxt_sym, pos["direction"]
+                    ccxt_sym, pos["direction"], opened_at=pos["opened_at"]
                 )
 
                 if not should_close:
@@ -422,17 +489,27 @@ class FundingArbitrageBot:
         return amount * (spot_rate + futures_rate)
 
     # ==================================================================
+    async def _task_reconcile(self):
+        try:
+            await self.reconciler.check()
+        except Exception as e:
+            logger.exception(f"对账任务异常: {e}")
+
     async def run(self):
         sched = AsyncIOScheduler()
         m = self.config["schedule"]["check_interval_minutes"]
 
+        job_defaults = {"max_instances": 1, "coalesce": True}
+
         if self.mode == "monitor":
-            sched.add_job(self.task_monitor_scan, "interval", minutes=m, id="monitor")
+            sched.add_job(self.task_monitor_scan, "interval", minutes=m, id="monitor", **job_defaults)
         else:
-            sched.add_job(self.task_scan_and_open, "interval", minutes=m, id="scan")
-            sched.add_job(self.task_check_and_close, "interval", minutes=m * 2, id="check")
-            sched.add_job(self.task_record_funding, "cron", hour="0,8,16", minute=5, id="funding")
-            sched.add_job(self.task_daily_report, "cron", hour=0, minute=30, id="report")
+            sched.add_job(self.task_scan_and_open, "interval", minutes=m, id="scan", **job_defaults)
+            sched.add_job(self.task_check_and_close, "interval", minutes=m * 2, id="check", **job_defaults)
+            sched.add_job(self.task_record_funding, "cron", hour="0,8,16", minute=5, id="funding", **job_defaults)
+            sched.add_job(self.task_daily_report, "cron", hour=0, minute=30, id="report", **job_defaults)
+            if self.reconciler:
+                sched.add_job(self._task_reconcile, "interval", hours=1, id="reconcile", **job_defaults)
 
         sched.start()
 
@@ -459,6 +536,8 @@ class FundingArbitrageBot:
         if self.mode == "monitor":
             await self.task_monitor_scan()
         else:
+            if self.reconciler:
+                await self._task_reconcile()  # 先对账，再开仓
             await self.task_scan_and_open()
 
         try:

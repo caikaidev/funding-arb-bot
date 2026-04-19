@@ -63,7 +63,7 @@ class DynamicScreener:
 
         rates = await self._batch_rates(symbols)
 
-        # 费率初筛
+        # 费率初筛（只做正费率：现货账户不支持裸空，负费率无法实现）
         candidates = []
         for sym, fr in rates.items():
             base = sym.split("/")[0]
@@ -73,9 +73,11 @@ class DynamicScreener:
             if tier not in active_tiers:
                 continue
             thresh = TIER_THRESHOLDS[tier]
-            rate = abs(fr.get("fundingRate", 0))
+            rate = fr.get("fundingRate", 0)
+            if rate <= 0:
+                continue
             if rate >= thresh["min_rate"]:
-                candidates.append({"symbol": sym, "tier": tier, "rate": fr["fundingRate"], "abs_rate": rate})
+                candidates.append({"symbol": sym, "tier": tier, "rate": rate, "abs_rate": rate})
 
         logger.info(f"费率初筛: {len(candidates)} 个")
 

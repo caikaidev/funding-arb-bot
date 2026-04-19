@@ -212,16 +212,18 @@ class PositionManager:
         return dict(row) if row else {}
 
     def get_daily_pnl(self, date_str: str = None) -> float:
-        """查询当日盈亏"""
+        """查询当日盈亏：今日结算的资金费 + 今日平仓的价格盈亏"""
         if date_str is None:
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        row = self.conn.execute(
-            """SELECT COALESCE(SUM(payment), 0) AS daily_pnl
-               FROM funding_logs
-               WHERE settled_at LIKE ?""",
+        funding_row = self.conn.execute(
+            "SELECT COALESCE(SUM(payment), 0) FROM funding_logs WHERE settled_at LIKE ?",
             (f"{date_str}%",),
         ).fetchone()
-        return float(row["daily_pnl"]) if row else 0.0
+        close_row = self.conn.execute(
+            "SELECT COALESCE(SUM(close_pnl), 0) FROM positions WHERE closed_at LIKE ? AND status='closed'",
+            (f"{date_str}%",),
+        ).fetchone()
+        return float(funding_row[0]) + float(close_row[0])
 
     def close_db(self):
         self.conn.close()

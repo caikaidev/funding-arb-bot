@@ -19,11 +19,29 @@
 - [x] **1.3** 分批下单 — `_split_order()` 按币种阈值拆单，批间隔 500ms
 - [x] **1.4** 基差感知开平仓 — `fetch_basis()` 检查入场基差，`open_basis` / `close_basis` 写入 DB
 
+### Phase 1.5 (v5.1) — 安全底线补全（上实盘前）
+- [x] **1.5** 部分成交检测 — `executor._check_fill()` 校验 `executedQty`，不足 99% 触发 rollback
+- [x] **1.6** 滑点超标硬中止 — 滑点超 `max_slippage` 时立即回滚两腿，不再仅 warning
+- [x] **1.7** 过滤负费率方向 — `screener.screen()` 只取 `rate > 0`，现货账户无法裸空
+- [x] **1.8** `min_profitable_rate` 上调 — 0.00005 → 0.0005；新增 `min_holding_hours: 24` 保护期，防震荡开平手续费失血
+- [x] **1.9** 账实对账器 — 新建 `reconciler.py`，启动 + 每小时核查合约持仓 vs DB，偏差 >5% 或孤儿仓 → TG 告警 + 暂停开仓
+- [x] **1.10** 日亏损上限接线 — `task_scan_and_open` 读 `daily_pnl`（含平仓 PnL），超阈值当日停开
+- [x] **1.11** 结算窗口封锁 — HH:59:30–HH:00:30 UTC 禁止开平仓，防结算时间竞争
+- [x] **1.12** 预期回本门槛 — 开仓前验证 `min_holding_hours` 内累计资金费 ≥ 双程手续费 × 1.5
+- [x] **1.13** APScheduler 防重入 — 所有 Job 加 `max_instances=1, coalesce=True`
+
 ---
 
 ## 待完成
 
-### Phase 2 (v6) — 实盘稳定后
+### Phase 2 (v6) — 实盘第一周补全（安全网）
+
+- [ ] **2.0** Rollback 失败 TG 告警 — `executor._rollback_spot/_rollback_futures` 中 `logger.critical` 改为同步推送 `notifier.on_error`
+- [ ] **2.0** WebSocket markPrice 实时监控 — 订阅 `!markPrice@arr`，持仓期间费率符号翻转秒级触发平仓评估（当前 REST 轮询最坏延迟 10min）
+- [ ] **2.0** 累计 funding 偏差监控 — 每小时对比实际累计 funding vs 开仓时预期，偏差 >50% 主动平仓
+- [ ] **2.0** 清理死代码 — `rate_reverse_count` 列 + `increment_reverse_count`/`reset_reverse_count` 方法未被任何逻辑调用，要么实现要么删除
+
+### Phase 2 (v6) — 实盘稳定后，策略优化
 
 - [ ] **2.1** 费率预测入场优化
   - `screener.py` 评分公式加入 `nextFundingRate` 权重（10%）

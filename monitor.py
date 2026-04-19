@@ -92,7 +92,9 @@ class FundingRateMonitor:
 
         return sorted(opportunities, key=lambda x: x["annualized"], reverse=True)
 
-    async def should_exit(self, symbol: str, direction: str) -> tuple[bool, str]:
+    async def should_exit(
+        self, symbol: str, direction: str, opened_at: str = None
+    ) -> tuple[bool, str]:
         """检查是否应该平仓"""
         data = await self.fetch_funding_rate(symbol)
         if data is None:
@@ -100,6 +102,15 @@ class FundingRateMonitor:
 
         rate = data["rate"]
         min_rate = self.strategy["exit"]["min_profitable_rate"]
+
+        # 最短持仓时间保护：在保护期内不因费率轻微变动而触发平仓
+        if opened_at:
+            min_hold = self.strategy["exit"].get("min_holding_hours", 24)
+            age_hours = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(opened_at)
+            ).total_seconds() / 3600
+            if age_hours < min_hold:
+                return False, ""
 
         if direction == "positive" and rate < 0:
             return True, f"费率转负 ({rate:.4%})"

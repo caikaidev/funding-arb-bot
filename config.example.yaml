@@ -73,7 +73,8 @@ strategy:
 
   exit:
     rate_reverse_count: 3
-    min_profitable_rate: 0.00005
+    min_profitable_rate: 0.0005   # 0.05%/8h，低于此值平仓（原 0.00005 会导致震荡开平手续费失血）
+    min_holding_hours: 24         # 最短持仓 24h（3 个结算周期），保护期内不因费率轻微波动平仓
     max_holding_days: 30
 
   risk:
