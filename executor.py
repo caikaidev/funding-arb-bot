@@ -71,6 +71,8 @@ class BinanceExecutor(BaseExecutor):
 
         # 缓存交易精度
         self._precision_cache = {}
+        # 严重告警队列（线程安全 append/clear），由 main 异步推送 TG
+        self._critical_errors: list[str] = []
 
     # ------------------------------------------------------------------
     # 精度 & 成交校验
@@ -472,6 +474,13 @@ class BinanceExecutor(BaseExecutor):
 
         if spot_error or futures_error:
             logger.error(f"平仓异常: spot={spot_error} futures={futures_error}")
+            # 单腿成功、另一腿失败：仓位已失衡，需立即告警
+            if not (spot_error and futures_error):
+                closed_leg = "spot" if spot_result is not None else "futures"
+                open_leg = "futures" if closed_leg == "spot" else "spot"
+                self._critical_errors.append(
+                    f"[紧急] 平仓单腿失败: {symbol} — {closed_leg}腿已平，{open_leg}腿失败，仓位失衡！需人工处理"
+                )
             return {"success": False, "error": f"spot={spot_error} futures={futures_error}"}
 
         # 校验成交量 + 补平尾单（平仓部分成交时不做 rollback，而是补单平尾）
@@ -519,6 +528,7 @@ class BinanceExecutor(BaseExecutor):
             logger.info(f"平仓尾单成功: {symbol} {leg}")
         except Exception as e:
             logger.critical(f"平仓尾单失败！需手动处理 {symbol} {leg} {tail_str}: {e}")
+            self._critical_errors.append(f"[紧急] 平仓尾单失败 {symbol} {leg}: {e}")
 
     # ------------------------------------------------------------------
     # 回滚 & 工具
@@ -531,6 +541,7 @@ class BinanceExecutor(BaseExecutor):
             logger.info("现货回滚成功")
         except Exception as e:
             logger.critical(f"现货回滚失败！需手动处理: {e}")
+            self._critical_errors.append(f"[紧急] 现货回滚失败 {symbol}: {e}")
 
     def _rollback_futures(self, symbol, quantity, direction):
         """回滚合约单"""
@@ -543,6 +554,7 @@ class BinanceExecutor(BaseExecutor):
             logger.info("合约回滚成功")
         except Exception as e:
             logger.critical(f"合约回滚失败！需手动处理: {e}")
+            self._critical_errors.append(f"[紧急] 合约回滚失败 {symbol}: {e}")
 
     def _calc_avg_price(self, order_result: dict) -> float:
         """从订单结果计算平均成交价"""

@@ -24,7 +24,9 @@ class SimulatedExecutor(BaseExecutor):
     def __init__(self, config: dict):
         self.fees = config["fees"]
         self.max_slippage = config["strategy"]["risk"]["max_slippage"]
+        self.max_single_order_usdt = config["strategy"]["risk"].get("max_single_order_usdt") or 0
         self.split_thresholds = config.get("split_thresholds", {})
+        self._critical_errors: list[str] = []
 
     def open_arbitrage(
         self,
@@ -35,6 +37,10 @@ class SimulatedExecutor(BaseExecutor):
         order_priority: str = "concurrent",
     ) -> dict:
         """模拟开仓：用实时价格 + 随机滑点，支持分批"""
+        if self.max_single_order_usdt and usdt_amount > self.max_single_order_usdt:
+            logger.error(f"[模拟] 单笔金额 ${usdt_amount:.0f} 超过硬上限 ${self.max_single_order_usdt:.0f}，拒绝下单")
+            return {"success": False, "error": f"fat_finger: ${usdt_amount:.0f} > ${self.max_single_order_usdt:.0f}"}
+
         chunks = self._split_order(symbol, usdt_amount)
 
         total_qty = 0.0

@@ -373,6 +373,88 @@ class TestReconciler(unittest.TestCase):
 
 
 # ===========================================================================
+# 测试组 7 — A2: 胖手指单笔硬上限
+# ===========================================================================
+
+class TestFatFinger(unittest.TestCase):
+
+    def test_over_limit_returns_failure(self):
+        """金额超过 max_single_order_usdt → 返回失败，不下单"""
+        exc = make_executor()
+        exc.max_single_order_usdt = 1000
+        result = exc.open_arbitrage("BTCUSDT", 2000, 60000)
+        self.assertFalse(result["success"])
+        self.assertIn("fat_finger", result["error"])
+        exc.spot.new_order.assert_not_called()
+        exc.futures.new_order.assert_not_called()
+
+    def test_zero_limit_disables_check(self):
+        """max_single_order_usdt=0 表示禁用，不拦截"""
+        exc = make_executor()
+        exc.max_single_order_usdt = 0
+        exc.spot.new_order = MagicMock(return_value=order_full("0.050", 60000.0))
+        exc.futures.new_order = MagicMock(return_value=order_full("0.050", 60010.0))
+        result = exc.open_arbitrage("BTCUSDT", 3000, 60000)
+        self.assertTrue(result["success"])
+
+    def test_at_exact_limit_passes(self):
+        """金额等于上限，允许通过"""
+        exc = make_executor()
+        exc.max_single_order_usdt = 3000
+        exc.spot.new_order = MagicMock(return_value=order_full("0.050", 60000.0))
+        exc.futures.new_order = MagicMock(return_value=order_full("0.050", 60010.0))
+        result = exc.open_arbitrage("BTCUSDT", 3000, 60000)
+        self.assertTrue(result["success"])
+
+
+# ===========================================================================
+# 测试组 8 — A3: _close_tail 平仓尾单
+# ===========================================================================
+
+class TestCloseTail(unittest.TestCase):
+
+    def setUp(self):
+        self.exc = make_executor()
+
+    def test_full_fill_no_tail_order(self):
+        """成交量 ≥ 99% 不补单"""
+        self.exc.spot.new_order = MagicMock()
+        self.exc._close_tail("BTCUSDT", "0.050", {"executedQty": "0.050"}, "positive", "spot")
+        self.exc.spot.new_order.assert_not_called()
+
+    def test_near_full_fill_no_tail_order(self):
+        """成交量 = 99.0% 临界值，不补单"""
+        self.exc.spot.new_order = MagicMock()
+        self.exc._close_tail("BTCUSDT", "0.100", {"executedQty": "0.099"}, "positive", "spot")
+        self.exc.spot.new_order.assert_not_called()
+
+    def test_partial_fill_spot_tail_sent(self):
+        """现货部分成交 → 补发卖单尾单"""
+        self.exc.spot.new_order = MagicMock(return_value={"executedQty": "0.025"})
+        self.exc._close_tail("BTCUSDT", "0.050", {"executedQty": "0.025"}, "positive", "spot")
+        self.exc.spot.new_order.assert_called_once()
+        call_kwargs = self.exc.spot.new_order.call_args.kwargs
+        self.assertEqual(call_kwargs["side"], "SELL")
+        self.assertEqual(call_kwargs["type"], "MARKET")
+
+    def test_partial_fill_futures_tail_sent(self):
+        """合约部分成交 → 补发 reduceOnly 买单尾单"""
+        self.exc.futures.new_order = MagicMock(return_value={"executedQty": "0.025"})
+        self.exc._close_tail("BTCUSDT", "0.050", {"executedQty": "0.025"}, "positive", "futures")
+        self.exc.futures.new_order.assert_called_once()
+        call_kwargs = self.exc.futures.new_order.call_args.kwargs
+        self.assertEqual(call_kwargs["side"], "BUY")
+        self.assertTrue(call_kwargs.get("reduceOnly"))
+
+    def test_tail_failure_appended_to_critical_errors(self):
+        """尾单补发失败 → 追加到 _critical_errors"""
+        self.exc.spot.new_order = MagicMock(side_effect=Exception("网络超时"))
+        self.exc._close_tail("BTCUSDT", "0.050", {"executedQty": "0.025"}, "positive", "spot")
+        self.assertGreater(len(self.exc._critical_errors), 0)
+        self.assertIn("尾单失败", self.exc._critical_errors[0])
+
+
+# ===========================================================================
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

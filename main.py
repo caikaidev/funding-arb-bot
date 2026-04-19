@@ -84,6 +84,10 @@ class FundingArbitrageBot:
         else:
             self.notifier = None
 
+        # executor 共享 notifier（用于回滚/尾单失败的 TG 告警队列消费）
+        if self.executor:
+            self.executor._notifier_ref = self.notifier  # 仅做标记，实际推送走 _flush_executor_alerts
+
         # 账实对账器（仅实盘，simulate 无需）
         self.reconciler = None
         if mode == "live":
@@ -93,6 +97,20 @@ class FundingArbitrageBot:
     # ==================================================================
     # 守卫方法
     # ==================================================================
+    async def _flush_executor_alerts(self):
+        """消费 executor._critical_errors 并推送 TG（rollback / 尾单 / 单腿平仓失败）"""
+        if not self.executor or not self.notifier:
+            if self.executor:
+                self.executor._critical_errors.clear()
+            return
+        errors = list(self.executor._critical_errors)
+        self.executor._critical_errors.clear()
+        for err in errors:
+            try:
+                await self.notifier.on_error(err)
+            except Exception:
+                pass
+
     @staticmethod
     def _in_settlement_window() -> bool:
         """检查是否处于 8h 结算封锁窗口 (HH:59:30 – HH:00:30 UTC)"""
@@ -249,14 +267,16 @@ class FundingArbitrageBot:
                 )
 
                 if result["success"]:
-                    fees = self._calc_fees(alloc)
+                    # 用实际成交金额（非预算 alloc），防止分批有批次失败时记账偏高
+                    actual_usdt = result["quantity"] * result["spot_avg_price"]
+                    fees = self._calc_fees(actual_usdt)
                     pos_id = self.positions.record_open(
                         symbol=coin["binance_symbol"],
                         direction=coin["direction"],
                         quantity=result["quantity"],
                         spot_price=result["spot_avg_price"],
                         futures_price=result["futures_avg_price"],
-                        usdt_amount=alloc,
+                        usdt_amount=actual_usdt,
                         slippage=result["slippage"],
                         fees_paid=fees,
                         open_basis=open_basis,
@@ -299,6 +319,8 @@ class FundingArbitrageBot:
                     await self.notifier.on_error(f"扫描开仓异常: {e}", exc=e)
                 except Exception:
                     pass
+        finally:
+            await self._flush_executor_alerts()
 
     # ==================================================================
     # 模拟 / 实盘：持仓检查→平仓
@@ -418,6 +440,8 @@ class FundingArbitrageBot:
                     await self.notifier.on_error(f"持仓检查异常: {e}", exc=e)
                 except Exception:
                     pass
+        finally:
+            await self._flush_executor_alerts()
 
     # ==================================================================
     # 费率结算（模拟和实盘共用）

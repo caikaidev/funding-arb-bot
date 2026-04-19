@@ -166,23 +166,6 @@ class PositionManager:
         logger.info(f"记录平仓: #{position_id}")
 
     # ------------------------------------------------------------------
-    # 费率反转计数（用于判断是否平仓）
-    # ------------------------------------------------------------------
-    def increment_reverse_count(self, position_id: int):
-        self.conn.execute(
-            "UPDATE positions SET rate_reverse_count = rate_reverse_count + 1 WHERE id = ?",
-            (position_id,),
-        )
-        self.conn.commit()
-
-    def reset_reverse_count(self, position_id: int):
-        self.conn.execute(
-            "UPDATE positions SET rate_reverse_count = 0 WHERE id = ?",
-            (position_id,),
-        )
-        self.conn.commit()
-
-    # ------------------------------------------------------------------
     # 查询
     # ------------------------------------------------------------------
     def get_open_positions(self) -> list[dict]:
