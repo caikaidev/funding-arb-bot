@@ -16,3 +16,6 @@ python-telegram-bot>=20.0
 
 # 日志
 loguru>=0.7.0
+
+# 重试
+tenacity>=8.0.0

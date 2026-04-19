@@ -180,7 +180,65 @@ def main():
         print(f"\n  {SKIP} 4. API 权限 — 监控模式不需要")
 
     # ------------------------------------------------------------------
-    print("\n📁 5. 目录")
+    if not monitor_only:
+        print("\n🔒 5. 安全检查 (API 权限 & 账户模式)")
+        # ------------------------------------------------------------------
+        if config_exists and has_key and has_secret:
+            import hmac as _hmac
+            import hashlib
+            import urllib.request
+            import urllib.parse
+            import urllib.error
+            import time as _time
+            from binance.spot import Spot as _Spot
+
+            # 5a. API Key 权限位
+            try:
+                _spot = _Spot(api_key=api_key, api_secret=api_secret)
+                perms = _spot.api_key_permission()
+
+                no_withdraw = not perms.get("enableWithdrawals", True)
+                if not check("API 提现权限已关闭", no_withdraw,
+                             "enableWithdrawals=False",
+                             "enableWithdrawals=True — 请在 Binance API 管理页关闭提现权限"):
+                    all_ok = False
+
+                if perms.get("ipRestrict", False):
+                    check("API IP 白名单", True, "已绑定固定 IP")
+                else:
+                    print(f"  {WARN} API IP 白名单 — 未绑定（建议绑定服务器固定 IP，降低 Key 泄露风险）")
+
+            except Exception as e:
+                print(f"  {WARN} API 权限查询失败: {str(e)[:80]}")
+
+            # 5b. Portfolio Margin 模式检测（PM 模式下 /fapi/ trading 端点会被限制）
+            try:
+                ts = int(_time.time() * 1000)
+                qs = f"timestamp={ts}"
+                sig = _hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+                url = f"https://api.binance.com/sapi/v1/portfolio/account?{qs}&signature={sig}"
+                req = urllib.request.Request(url, headers={"X-MBX-APIKEY": api_key})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    is_pm = resp.status == 200
+            except urllib.error.HTTPError:
+                is_pm = False  # 4xx = Classic 模式 / 未开通 PM
+            except Exception as e:
+                is_pm = None
+                print(f"  {WARN} 账户模式检测失败: {str(e)[:60]}（请手动确认非 PM 模式）")
+
+            if is_pm is not None:
+                if not check("账户模式 — Classic",
+                             not is_pm,
+                             "独立 Spot + USDⓈ-M Futures 钱包",
+                             "Portfolio Margin 模式已开启！请在网页端切回 Classic 再启动 bot"):
+                    all_ok = False
+        else:
+            print(f"  {SKIP} 需要先配置 API Key")
+    else:
+        print(f"\n  {SKIP} 5. 安全检查 — 监控模式不需要")
+
+    # ------------------------------------------------------------------
+    print("\n📁 6. 目录")
     # ------------------------------------------------------------------
     os.makedirs("logs", exist_ok=True)
     check("logs/ 目录", os.path.isdir("logs"))

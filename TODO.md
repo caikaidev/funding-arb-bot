@@ -1,7 +1,16 @@
 # 资金费率套利机器人 — 开发路线图
 
 > 详细设计见 `docs/plan.md`
-> 最后更新：2026-04-16
+> 最后更新：2026-04-19
+
+---
+
+## 上实盘前用户手动操作（账户侧，非代码）
+
+- [ ] 币安网页端平掉所有 PM 模式仓位，切回 **Classic 模式**（Spot + USDⓈ-M Futures 独立钱包）
+- [ ] 运行 `python preflight.py` 确认"账户模式 — Classic"显示通过
+- [ ] API Key **关闭提现权限**（Binance API 管理页 → enableWithdrawals = false）
+- [ ] API Key **绑定服务器固定 IP** 白名单
 
 ---
 
@@ -36,6 +45,10 @@
 
 ### Phase 2 (v6) — 实盘第一周补全（安全网）
 
+- [x] **2.0** preflight 安全检查扩展 — 验证 API `enableWithdrawals=False` + `ipRestrict` + 检测 PM 模式（PM 已开启则拒绝启动）
+- [x] **2.0** 胖手指单笔硬上限 — `strategy.risk.max_single_order_usdt`，`executor.open_arbitrage` 入口校验
+- [x] **2.0** 平仓路径 `_check_fill` 补齐 — `_close_single` 两腿均加成交量校验，部分成交时自动补发尾单（`_close_tail`）
+- [x] **2.0** HTTP 指数退避重试 — 引入 `tenacity`，只读查询方法（余额/持仓/精度）加 `@_query_retry`（3 次, 1→4→16s, 仅对 429/5xx）
 - [ ] **2.0** Rollback 失败 TG 告警 — `executor._rollback_spot/_rollback_futures` 中 `logger.critical` 改为同步推送 `notifier.on_error`
 - [ ] **2.0** WebSocket markPrice 实时监控 — 订阅 `!markPrice@arr`，持仓期间费率符号翻转秒级触发平仓评估（当前 REST 轮询最坏延迟 10min）
 - [ ] **2.0** 累计 funding 偏差监控 — 每小时对比实际累计 funding vs 开仓时预期，偏差 >50% 主动平仓

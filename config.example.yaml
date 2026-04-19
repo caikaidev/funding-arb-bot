@@ -81,6 +81,7 @@ strategy:
     max_leverage: 1
     max_slippage: 0.002
     daily_loss_limit_pct: 0.005   # 单日亏损上限 = 本金的 0.5%
+    max_single_order_usdt: 5000   # 单笔下单硬上限（胖手指保护，设为 0 或省略则不限制）
 
 # --------------------------------------------------
 # 手续费
