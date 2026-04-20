@@ -129,8 +129,36 @@ class FundingArbitrageBot:
     # ==================================================================
     # 监控模式
     # ==================================================================
+    def _append_raw_csv(self, rows: list[dict]) -> None:
+        """把全量原始快照追加到日 CSV, 用于阶段 1 分析费率分布。"""
+        import csv, os
+        if not rows:
+            return
+        os.makedirs("logs", exist_ok=True)
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        path = f"logs/monitor-candidates-{date_str}.csv"
+        fieldnames = [
+            "timestamp", "symbol", "tier", "funding_rate", "annualized",
+            "mark_price", "index_price", "predicted_rate", "next_funding_time",
+        ]
+        is_new = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            if is_new:
+                writer.writeheader()
+            writer.writerows(rows)
+
     async def task_monitor_scan(self):
         try:
+            # 阶段 1 数据采集: 在 screen 之前先落一份全量快照（含 T3 且不过滤）
+            try:
+                raw = await self.screener.raw_snapshot()
+                if raw:
+                    self._append_raw_csv(raw)
+                    logger.info(f"原始快照已写入 CSV ({len(raw)} 行)")
+            except Exception as e:
+                logger.warning(f"原始快照写入失败: {e}")
+
             qualified = await self.screener.screen()
             if not qualified:
                 logger.info("未发现合格标的")

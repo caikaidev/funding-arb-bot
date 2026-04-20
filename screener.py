@@ -53,6 +53,44 @@ class DynamicScreener:
         self.plan = plan
 
     # ------------------------------------------------------------------
+    async def raw_snapshot(self) -> list[dict]:
+        """
+        阶段 1 数据采集用：全量永续费率快照, 不做任何过滤（tier / rate / 黑名单都忽略）。
+
+        复用 _load_markets + 批量 fetch_funding_rates, 额外带上 mark / index /
+        预测费率 等字段, 供 monitor 模式落 CSV 以事后分析费率分布、调优阈值。
+
+        注意: 与 screen() 解耦, 哪怕 screen 流程报错也不影响这份快照。
+        """
+        markets = await self._load_markets()
+
+        try:
+            all_r = await self.exchange.fetch_funding_rates()
+        except Exception as e:
+            logger.warning(f"raw_snapshot 批量费率失败: {e}")
+            return []
+
+        snapshot = []
+        ts = datetime.now(timezone.utc).isoformat()
+        for sym, fr in all_r.items():
+            if sym not in markets:
+                continue
+            rate = fr.get("fundingRate") or 0
+            info = fr.get("info") or {}
+            snapshot.append({
+                "timestamp": ts,
+                "symbol": sym.replace("/", "").replace(":USDT", ""),
+                "tier": classify(sym),
+                "funding_rate": rate,
+                "annualized": abs(float(rate)) * 3 * 365 if rate else 0,
+                "mark_price": fr.get("markPrice") or info.get("markPrice"),
+                "index_price": fr.get("indexPrice") or info.get("indexPrice"),
+                "predicted_rate": fr.get("nextFundingRate"),
+                "next_funding_time": fr.get("fundingDatetime"),
+            })
+        return snapshot
+
+    # ------------------------------------------------------------------
     async def screen(self) -> list[dict]:
         markets = await self._load_markets()
 
