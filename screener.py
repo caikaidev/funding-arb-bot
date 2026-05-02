@@ -7,31 +7,10 @@ from datetime import datetime, timezone
 from loguru import logger
 
 from capital import CapitalPlan
+from tiers import TIER1_BASES, TIER2_BASES, TIER_THRESHOLDS, classify
 
 
-TIER1_BASES = {"BTC", "ETH"}
-TIER2_BASES = {
-    "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK",
-    "DOT", "NEAR", "SUI", "ARB", "OP", "UNI", "APT",
-    "TIA", "FIL", "ATOM", "LTC", "ETC", "MATIC",
-}
 BLACKLIST_BASES = set()
-
-# 流动性门槛（固定，与资金量无关）
-TIER_THRESHOLDS = {
-    1: {"min_vol": 500e6, "min_oi": 200e6, "max_spread": 0.0003, "min_depth": 1e6, "min_rate": 0.00015, "min_hours": 0},
-    2: {"min_vol": 100e6, "min_oi": 50e6,  "max_spread": 0.0005, "min_depth": 500e3, "min_rate": 0.0002, "min_hours": 0},
-    3: {"min_vol": 20e6,  "min_oi": 10e6,  "max_spread": 0.001,  "min_depth": 100e3, "min_rate": 0.0004, "min_hours": 48},
-}
-
-
-def classify(symbol: str) -> int:
-    base = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
-    if base in TIER1_BASES:
-        return 1
-    if base in TIER2_BASES:
-        return 2
-    return 3
 
 
 class DynamicScreener:
@@ -115,7 +94,11 @@ class DynamicScreener:
             if rate <= 0:
                 continue
             if rate >= thresh["min_rate"]:
-                candidates.append({"symbol": sym, "tier": tier, "rate": rate, "abs_rate": rate})
+                candidates.append({
+                    "symbol": sym, "tier": tier, "rate": rate, "abs_rate": rate,
+                    "next_funding_time": fr.get("fundingTimestamp"),
+                    "predicted_rate": fr.get("nextFundingRate"),
+                })
 
         logger.info(f"费率初筛: {len(candidates)} 个")
 
@@ -279,7 +262,37 @@ class DynamicScreener:
         o = min(100, 60 + (c["open_interest"] / max(thresh["min_oi"], 1) - 1) * 40 / 9)
         s = max(0, 100 - c["spread_pct"] / thresh["max_spread"] * 100)
         a = min(100, c.get("listing_hours", 9999) / 720 * 100)
-        return round(r * 0.4 + v * 0.25 + o * 0.15 + s * 0.15 + a * 0.05, 1)
+        base = r * 0.4 + v * 0.25 + o * 0.15 + s * 0.15 + a * 0.05
+
+        # predicted_rate 风险因子: 预测值显著低于当前值时降权（提前规避费率衰减）
+        predicted = c.get("predicted_rate")
+        if predicted is not None and c.get("abs_rate", 0) > 0:
+            try:
+                ratio = float(predicted) / c["abs_rate"]
+                if ratio < 0.3:
+                    base *= 0.7
+                elif ratio < 0.5:
+                    base *= 0.85
+                elif ratio > 1.2:
+                    base *= 1.1
+            except (TypeError, ValueError):
+                pass
+
+        # 临近结算加分: 鼓励快速回本（30min 内 +8 分，60min 内 +4 分）
+        settlement_bonus = 0
+        nft = c.get("next_funding_time")
+        if nft:
+            try:
+                now_ms = datetime.now(timezone.utc).timestamp() * 1000
+                mins_to_settle = (float(nft) - now_ms) / 60000
+                if 0 < mins_to_settle <= 30:
+                    settlement_bonus = 8
+                elif 30 < mins_to_settle <= 60:
+                    settlement_bonus = 4
+            except (TypeError, ValueError):
+                pass
+
+        return round(base + settlement_bonus, 1)
 
     async def close(self):
         await self.exchange.close()

@@ -127,6 +127,142 @@ class FundingArbitrageBot:
         return expected_funding >= two_way_fee * 1.5
 
     # ==================================================================
+    # 动态换仓
+    # ==================================================================
+    async def _find_rotation_target(self, candidate: dict, open_positions: list[dict]):
+        """
+        返回可被 candidate 替换的最差持仓（同 tier 内 score 最低且持仓 ≥ min_age_hours）。
+        没有合适目标返回 None。
+        """
+        cfg = self.config["strategy"].get("rotation", {})
+        if not cfg.get("enabled", False):
+            return None
+        if self._in_settlement_window():
+            return None
+
+        multiplier = cfg.get("score_multiplier", 1.5)
+        min_age = cfg.get("min_age_hours", 24)
+        tier = candidate["tier"]
+
+        same_tier = [p for p in open_positions if classify(_to_ccxt(p["symbol"])) == tier]
+        if not same_tier:
+            return None
+
+        now = datetime.now(timezone.utc)
+        worst = None
+        worst_score = float("inf")
+
+        for pos in same_tier:
+            opened = datetime.fromisoformat(pos["opened_at"])
+            age_h = (now - opened).total_seconds() / 3600
+            if age_h < min_age:
+                continue
+
+            ccxt_sym = _to_ccxt(pos["symbol"])
+            rate_data = await self.monitor.fetch_funding_rate(ccxt_sym)
+            if not rate_data:
+                continue
+            cur_rate = rate_data["rate"]
+            # 方向不一致或费率已转向 → 留给 task_check_and_close 处理
+            if pos["direction"] == "positive" and cur_rate <= 0:
+                continue
+            if pos["direction"] == "reverse" and cur_rate >= 0:
+                continue
+
+            detail = await self.screener._evaluate(ccxt_sym)
+            if not detail:
+                continue
+
+            cur_score = self.screener._score({
+                "tier": tier,
+                "abs_rate": abs(cur_rate),
+                "annualized": abs(cur_rate) * 3 * 365,
+                **detail,
+            })
+            if cur_score < worst_score:
+                worst_score = cur_score
+                worst = (pos, cur_score)
+
+        if worst is None:
+            return None
+
+        if candidate["score"] >= worst_score * multiplier:
+            return worst[0]
+        return None
+
+    async def _close_position(self, pos: dict, reason: str) -> bool:
+        """
+        平仓单个持仓（提取自 task_check_and_close 的平仓子流程，供换仓复用）。
+        返回 True 表示平仓成功。
+        """
+        symbol = pos["symbol"]
+        ccxt_sym = _to_ccxt(symbol)
+
+        basis_data = await self.monitor.fetch_basis(ccxt_sym)
+        close_basis = basis_data["basis_pct"] if basis_data else None
+        if basis_data:
+            current_price = basis_data["perp_price"]
+        else:
+            ticker = await self.monitor.get_ticker(ccxt_sym)
+            current_price = float(ticker["last"]) if ticker and ticker.get("last") else None
+
+        result = self.executor.close_arbitrage(
+            symbol, pos["quantity"], pos["direction"],
+            current_price=current_price,
+            usdt_amount=pos["usdt_amount"],
+        )
+        if not result.get("success"):
+            return False
+
+        close_spot = result.get("spot_avg_price", 0)
+        close_futures = result.get("futures_avg_price", 0)
+        if close_spot and close_futures:
+            if pos["direction"] == "positive":
+                close_pnl = (
+                    (close_spot - pos["spot_price"])
+                    + (pos["futures_price"] - close_futures)
+                ) * pos["quantity"]
+            else:
+                close_pnl = (
+                    (pos["spot_price"] - close_spot)
+                    + (close_futures - pos["futures_price"])
+                ) * pos["quantity"]
+        else:
+            close_pnl = 0
+
+        fees = self._calc_fees(pos["usdt_amount"])
+        rebate = (pos["fees_paid"] + fees) * self.fees_cfg["rebate_rate"]
+        self.positions.record_close(pos["id"], close_pnl, fees, rebate, close_basis)
+
+        close_spot_side = "SELL" if pos["direction"] == "positive" else "BUY"
+        close_futures_side = "BUY" if pos["direction"] == "positive" else "SELL"
+        spot_fee = pos["usdt_amount"] * self.fees_cfg["spot_taker"]
+        futures_fee = pos["usdt_amount"] * self.fees_cfg["futures_taker"]
+        self.positions.record_trade(
+            pos["id"], "close", close_spot_side, "spot",
+            symbol, pos["quantity"], close_spot, spot_fee, result.get("spot"),
+        )
+        self.positions.record_trade(
+            pos["id"], "close", close_futures_side, "futures",
+            symbol, pos["quantity"], close_futures, futures_fee, result.get("futures"),
+        )
+
+        tag = "[模拟]" if self.mode == "simulate" else "[实盘]"
+        logger.info(f"{tag} 平仓 {symbol}: {reason} | 价格盈亏 ${close_pnl:+.4f}")
+
+        if self.notifier:
+            total_fees = pos["fees_paid"] + fees
+            net_pnl = pos["funding_earned"] + close_pnl - total_fees + rebate
+            try:
+                await self.notifier.on_close(
+                    symbol, pos["funding_earned"],
+                    total_fees, rebate, net_pnl, reason,
+                )
+            except Exception:
+                pass
+        return True
+
+    # ==================================================================
     # 监控模式
     # ==================================================================
     def _append_raw_csv(self, rows: list[dict]) -> None:
@@ -259,6 +395,25 @@ class FundingArbitrageBot:
 
             for coin in qualified:
                 ok, alloc, reason = self.screener.check_allocation(coin, open_pos)
+
+                # 槽位已满时尝试动态换仓
+                if not ok and "已满" in reason:
+                    target = await self._find_rotation_target(coin, open_pos)
+                    if target:
+                        rot_reason = f"主动换仓 → {coin['binance_symbol']}"
+                        logger.info(
+                            f"触发换仓: 平 {target['symbol']} 换入 {coin['binance_symbol']} "
+                            f"(新 score {coin['score']:.1f})"
+                        )
+                        if not await self._close_position(target, rot_reason):
+                            logger.warning(f"换仓平仓失败，跳过 {coin['binance_symbol']}")
+                            continue
+                        # 刷新仓位与可用资金
+                        open_pos = self.positions.get_open_positions()
+                        used = sum(p["usdt_amount"] for p in open_pos)
+                        available = self.plan.tradable - used
+                        ok, alloc, reason = self.screener.check_allocation(coin, open_pos)
+
                 if not ok:
                     continue
                 alloc = min(alloc, available)

@@ -1,7 +1,7 @@
 # 资金费率套利机器人 — 开发路线图
 
 > 详细设计见 `docs/plan.md`
-> 最后更新：2026-04-19
+> 最后更新：2026-04-29
 
 ---
 
@@ -28,6 +28,16 @@
 - [x] **1.3** 分批下单 — `_split_order()` 按币种阈值拆单，批间隔 500ms
 - [x] **1.4** 基差感知开平仓 — `fetch_basis()` 检查入场基差，`open_basis` / `close_basis` 写入 DB
 
+### Phase 2.5 (v6.1) — 监控数据复盘改进（2026-04-29）
+
+> 基于 8 天 monitor 模式（81 万行 CSV）回放分析驱动的精准修复。
+
+- [x] **2.5.1** T1/T2 入场阈值放宽到 ~10% 年化 — `screener.TIER_THRESHOLDS` T1/T2 `min_rate` 0.00015/0.0002 → 0.0001。本周 BTC/ETH/BNB 等 8 天最高年化 8.5–13.2%，原阈值 15%/22% 全部错过，$6,000 T1/T2 资金完全闲置
+- [x] **2.5.2** 动态换仓 — `main._find_rotation_target` + `_close_position`，`task_scan_and_open` 中槽位满时按 score×1.5 触发换仓；`config.strategy.rotation` 配置块。本周 PIPPINUSDT 锁槽 7 天阻挡 DAMUSDT 530% 年化机会，潜在多赚 +$16
+- [x] **2.5.3** 临近结算评分加分 — `screener._score` 给「下次结算 ≤30min」的标的 +8 分、≤60min +4 分，加快手续费回本
+- [x] **2.5.4** predicted_rate 风险因子 — `screener._score` 引入预测费率乘数（衰减预期 ×0.7, 上涨预期 ×1.1），规避开仓后立即跳水
+- [x] **2.5.5** 回测框架 — 新建 `backtest.py`，复用 TIER_THRESHOLDS 重放 CSV 模拟开/平仓，支持 `--enable-rotation` 对照实验
+
 ### Phase 1.5 (v5.1) — 安全底线补全（上实盘前）
 - [x] **1.5** 部分成交检测 — `executor._check_fill()` 校验 `executedQty`，不足 99% 触发 rollback
 - [x] **1.6** 滑点超标硬中止 — 滑点超 `max_slippage` 时立即回滚两腿，不再仅 warning
@@ -50,7 +60,10 @@
 - [x] **2.0** 平仓路径 `_check_fill` 补齐 — `_close_single` 两腿均加成交量校验，部分成交时自动补发尾单（`_close_tail`）
 - [x] **2.0** HTTP 指数退避重试 — 引入 `tenacity`，只读查询方法（余额/持仓/精度）加 `@_query_retry`（3 次, 1→4→16s, 仅对 429/5xx）
 - [ ] **2.0** Rollback 失败 TG 告警 — `executor._rollback_spot/_rollback_futures` 中 `logger.critical` 改为同步推送 `notifier.on_error`
-- [ ] **2.0** WebSocket markPrice 实时监控 — 订阅 `!markPrice@arr`，持仓期间费率符号翻转秒级触发平仓评估（当前 REST 轮询最坏延迟 10min）
+- [ ] **2.0** WebSocket markPrice 实时监控 — 订阅 `!markPrice@arr`，双向受益：
+  - 持仓期：费率符号翻转秒级触发平仓评估（当前 REST 轮询最坏延迟 10min）
+  - 开仓期：捕获 5min 扫描错过的短脉冲机会（本周 UBUSDT 190% 年化窗口仅持续 1 个扫描周期；DAMUSDT 0.93%/8h 尖峰可能错过最高点）
+  - 实施: 新增 `ws_monitor.py`，screener 优先用缓存 + REST 降级；费率突变（5min 内涨幅 >50%）触发即时扫描
 - [ ] **2.0** 累计 funding 偏差监控 — 每小时对比实际累计 funding vs 开仓时预期，偏差 >50% 主动平仓
 - [ ] **2.0** 清理死代码 — `rate_reverse_count` 列 + `increment_reverse_count`/`reset_reverse_count` 方法未被任何逻辑调用，要么实现要么删除
 
