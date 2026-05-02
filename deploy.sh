@@ -168,20 +168,20 @@ API_KEY=$(python -c "
 import yaml, sys
 try:
     c = yaml.safe_load(open('config.yaml'))
-    k = (c.get('binance') or {}).get('api_key', '') or ''
+    k = ((c.get('exchanges') or {}).get('binance') or {}).get('api_key', '') or ''
     print(k.strip())
 except Exception as e:
     sys.exit(1)
 " 2>/dev/null || echo "")
 
 if [ -z "$API_KEY" ]; then
-    error "config.yaml 里 binance.api_key 未设置"
+    error "config.yaml 里 exchanges.binance.api_key 未设置"
 fi
 if [ "$API_KEY" = "YOUR_BINANCE_API_KEY" ]; then
-    error "config.yaml 里 binance.api_key 还是占位符, 请填入真实 Key"
+    error "config.yaml 里 exchanges.binance.api_key 还是占位符, 请填入真实 Key"
 fi
 if [ "${#API_KEY}" -lt 20 ]; then
-    error "config.yaml 里 binance.api_key 长度异常（${#API_KEY} 位）, 请检查"
+    error "config.yaml 里 exchanges.binance.api_key 长度异常（${#API_KEY} 位）, 请检查"
 fi
 
 info "API Key 格式检查通过"
