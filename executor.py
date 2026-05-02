@@ -418,6 +418,11 @@ class BinanceExecutor(BaseExecutor):
         partial = len(successful) < len(chunks_qty)
         if partial:
             logger.warning(f"部分平仓: {symbol} 完成 {len(successful)}/{len(chunks_qty)} 批")
+            # 分批平仓只完成部分时，仓位已变成“半平”状态，必须触发人工关注
+            self._critical_errors.append(
+                f"[紧急] 部分平仓: {symbol} 完成 {len(successful)}/{len(chunks_qty)} 批，"
+                "请尽快核对剩余仓位，避免账实错配"
+            )
 
         return {
             "success": True,
@@ -425,6 +430,7 @@ class BinanceExecutor(BaseExecutor):
             "futures_avg_price": weighted_futures / total_qty,
             "chunks": len(successful),
             "partial": partial,
+            "quantity": total_qty,
         }
 
     def _close_single(

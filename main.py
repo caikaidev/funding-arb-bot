@@ -111,12 +111,37 @@ class FundingArbitrageBot:
             except Exception:
                 pass
 
+    async def _mark_partial_close_risk(self, symbol: str) -> None:
+        """
+        部分平仓后立即标记账实风险，阻止继续开仓直到对账恢复。
+        """
+        msg = f"平仓未完成（部分成交）: {symbol}，已暂停开仓，等待对账恢复"
+        logger.error(msg)
+        if self.reconciler:
+            self.reconciler.is_clean = False
+        if self.notifier:
+            try:
+                await self.notifier.on_error(msg)
+            except Exception:
+                pass
+
     @staticmethod
     def _in_settlement_window() -> bool:
         """检查是否处于 8h 结算封锁窗口 (HH:59:30 – HH:00:30 UTC)"""
         now = datetime.now(timezone.utc)
         m, s = now.minute, now.second
         return (m == 59 and s >= 30) or (m == 0 and s <= 30)
+
+    @staticmethod
+    def _funding_settlement_key(now: datetime | None = None) -> str:
+        """
+        生成当前 8h 结算周期 key（UTC），用于资金费入账幂等去重。
+        例如: 2026-05-02T08:00:00Z
+        """
+        now = now or datetime.now(timezone.utc)
+        slot_hour = (now.hour // 8) * 8
+        slot = now.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
+        return slot.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _passes_break_even(self, coin: dict, alloc: float) -> bool:
         """预期回本检查：min_holding_hours 内累计资金费 ≥ 双程手续费 × 1.5"""
@@ -212,6 +237,9 @@ class FundingArbitrageBot:
             usdt_amount=pos["usdt_amount"],
         )
         if not result.get("success"):
+            return False
+        if result.get("partial"):
+            await self._mark_partial_close_risk(symbol)
             return False
 
         close_spot = result.get("spot_avg_price", 0)
@@ -468,8 +496,8 @@ class FundingArbitrageBot:
                     # 记录两条腿的成交明细
                     spot_side = "BUY" if coin["direction"] == "positive" else "SELL"
                     futures_side = "SELL" if coin["direction"] == "positive" else "BUY"
-                    spot_fee = alloc * self.fees_cfg["spot_taker"]
-                    futures_fee = alloc * self.fees_cfg["futures_taker"]
+                    spot_fee = actual_usdt * self.fees_cfg["spot_taker"]
+                    futures_fee = actual_usdt * self.fees_cfg["futures_taker"]
                     self.positions.record_trade(
                         pos_id, "open", spot_side, "spot",
                         coin["binance_symbol"], result["quantity"],
@@ -484,15 +512,15 @@ class FundingArbitrageBot:
                     if self.notifier:
                         await self.notifier.on_open(
                             coin["binance_symbol"], coin["direction"],
-                            alloc, result["slippage"], coin["rate"],
+                            actual_usdt, result["slippage"], coin["rate"],
                         )
                     open_pos = self.positions.get_open_positions()
-                    available -= alloc
+                    available -= actual_usdt
 
                     tag = "[模拟]" if self.mode == "simulate" else "[实盘]"
                     logger.info(
                         f"{tag} 开仓 [{coin['tier_name']}] "
-                        f"{coin['binance_symbol']} ${alloc:.0f}"
+                        f"{coin['binance_symbol']} ${actual_usdt:.0f}"
                     )
 
         except Exception as e:
@@ -560,6 +588,10 @@ class FundingArbitrageBot:
                         usdt_amount=pos["usdt_amount"],
                     )
                     if result["success"]:
+                        if result.get("partial"):
+                            await self._mark_partial_close_risk(symbol)
+                            continue
+
                         # 计算价格盈亏（对冲组合中的基差变化）
                         close_spot = result.get("spot_avg_price", 0)
                         close_futures = result.get("futures_avg_price", 0)
@@ -631,13 +663,21 @@ class FundingArbitrageBot:
     # ==================================================================
     async def task_record_funding(self):
         try:
+            settlement_key = self._funding_settlement_key()
             for pos in self.positions.get_open_positions():
                 data = await self.monitor.fetch_funding_rate(_to_ccxt(pos["symbol"]))
                 if not data:
                     continue
                 rate = data["rate"]
                 payment = pos["usdt_amount"] * (rate if pos["direction"] == "positive" else -rate)
-                self.positions.record_funding(pos["id"], rate, payment)
+                recorded = self.positions.record_funding(
+                    pos["id"], rate, payment, settlement_key=settlement_key
+                )
+                if not recorded:
+                    logger.warning(
+                        f"跳过重复资金费记录: {pos['symbol']} | key={settlement_key}"
+                    )
+                    continue
 
                 tag = "[模拟]" if self.mode == "simulate" else "[实盘]"
                 logger.info(
