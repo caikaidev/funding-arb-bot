@@ -42,6 +42,7 @@ class PositionManager:
                 rate            REAL NOT NULL,
                 payment         REAL NOT NULL,
                 settled_at      TEXT NOT NULL,
+                settlement_key  TEXT,
                 FOREIGN KEY (position_id) REFERENCES positions(id)
             );
 
@@ -68,6 +69,19 @@ class PositionManager:
                 self.conn.commit()
             except Exception:
                 pass  # 列已存在
+
+        # 迁移：为 funding_logs 添加幂等 key（已存在时静默忽略）
+        try:
+            self.conn.execute("ALTER TABLE funding_logs ADD COLUMN settlement_key TEXT")
+            self.conn.commit()
+        except Exception:
+            pass
+        # 同一持仓同一结算周期只允许一条资金费记录（NULL 不参与唯一约束）
+        self.conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_funding_logs_pos_settlement
+               ON funding_logs(position_id, settlement_key)"""
+        )
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # 开仓记录
@@ -132,17 +146,39 @@ class PositionManager:
     # ------------------------------------------------------------------
     # 费率收入记录
     # ------------------------------------------------------------------
-    def record_funding(self, position_id: int, rate: float, payment: float):
+    def record_funding(
+        self,
+        position_id: int,
+        rate: float,
+        payment: float,
+        settlement_key: str | None = None,
+    ) -> bool:
+        """
+        记录资金费收入。
+        返回 True 表示本次已成功入账；False 表示命中幂等去重（重复周期）。
+        """
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
-            "INSERT INTO funding_logs (position_id, rate, payment, settled_at) VALUES (?, ?, ?, ?)",
-            (position_id, rate, payment, now),
-        )
+        if settlement_key:
+            cur = self.conn.execute(
+                """INSERT OR IGNORE INTO funding_logs
+                   (position_id, rate, payment, settled_at, settlement_key)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (position_id, rate, payment, now, settlement_key),
+            )
+            if cur.rowcount == 0:
+                self.conn.commit()
+                return False
+        else:
+            self.conn.execute(
+                "INSERT INTO funding_logs (position_id, rate, payment, settled_at) VALUES (?, ?, ?, ?)",
+                (position_id, rate, payment, now),
+            )
         self.conn.execute(
             "UPDATE positions SET funding_earned = funding_earned + ? WHERE id = ?",
             (payment, position_id),
         )
         self.conn.commit()
+        return True
 
     # ------------------------------------------------------------------
     # 平仓记录
