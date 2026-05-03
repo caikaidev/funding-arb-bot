@@ -12,6 +12,20 @@ from datetime import datetime, timezone
 from collections import defaultdict
 
 
+def _initial_capital_hint() -> str:
+    """用于空库提示；优先读 config.yaml，失败则给通用说明。"""
+    try:
+        import yaml
+
+        with open("config.yaml") as f:
+            cap = yaml.safe_load(f).get("initial_capital")
+        if cap is not None:
+            return f"python main.py --simulate --capital {cap}"
+    except Exception:
+        pass
+    return "python main.py --simulate（资金可用 config.yaml 的 initial_capital，勿须与示例一致）"
+
+
 def main():
     parser = argparse.ArgumentParser(description="查看套利结果")
     parser.add_argument("--db", default="simulate.db", help="数据库文件")
@@ -63,7 +77,7 @@ def main():
 
     if not positions:
         print(f"\n  数据库为空，还没有交易记录。")
-        print(f"  确认机器人已运行: python main.py --simulate --capital 10000")
+        print(f"  确认机器人已运行: {_initial_capital_hint()}")
         print(f"{'='*60}")
         return
 
