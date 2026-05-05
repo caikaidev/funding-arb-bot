@@ -13,16 +13,27 @@ class FundingRateMonitor:
     仅用于读取数据，不涉及下单，因此 ccxt 内置的 brokerId 不影响返佣。
     """
 
-    def __init__(self, config: dict):
-        binance_cfg = config["exchanges"]["binance"]
-        self.exchange = ccxt.binance(
-            {
-                "apiKey": binance_cfg["api_key"],
-                "secret": binance_cfg["api_secret"],
-                "options": {"defaultType": "swap"},
-                "enableRateLimit": True,
-            }
-        )
+    def __init__(self, config: dict, exchange=None):
+        """
+        Args:
+            config: 完整配置 dict
+            exchange: 可选的外部 ccxt 客户端。传入则共用（节省 markets metadata 内存
+                ~80MB，并让 rate limiter 全局生效）；不传则自建（旧行为）。
+        """
+        if exchange is not None:
+            self.exchange = exchange
+            self._owns_exchange = False
+        else:
+            binance_cfg = config["exchanges"]["binance"]
+            self.exchange = ccxt.binance(
+                {
+                    "apiKey": binance_cfg["api_key"],
+                    "secret": binance_cfg["api_secret"],
+                    "options": {"defaultType": "swap"},
+                    "enableRateLimit": True,
+                }
+            )
+            self._owns_exchange = True
         self.strategy = config["strategy"]
 
     # ------------------------------------------------------------------
@@ -172,4 +183,6 @@ class FundingRateMonitor:
             return None
 
     async def close(self):
-        await self.exchange.close()
+        # 仅关闭自建的 exchange；共用的由所有者（screener）负责关
+        if self._owns_exchange:
+            await self.exchange.close()

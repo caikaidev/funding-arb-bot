@@ -4,6 +4,8 @@
 使用方式:
   python preflight.py              # 检查全部
   python preflight.py --monitor    # 只检查监控模式需要的项目
+  python preflight.py --live       # 实盘：额外硬卡 spot/futures USDT 余额 ≥ capital
+  python preflight.py --live --capital 410   # 用 CLI 值覆盖 config.yaml 的 initial_capital
 """
 import sys
 import os
@@ -26,8 +28,13 @@ def check(name: str, ok: bool, msg_pass: str = "", msg_fail: str = "") -> bool:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--monitor", action="store_true", help="只检查监控模式")
+    parser.add_argument("--live", action="store_true",
+                        help="实盘模式：额外硬卡 spot/futures USDT 余额 ≥ capital")
+    parser.add_argument("--capital", type=float, default=None,
+                        help="覆盖 config.yaml 的 initial_capital（用于实盘余额校验）")
     args = parser.parse_args()
     monitor_only = args.monitor
+    live_mode = args.live and not args.monitor
 
     all_ok = True
 
@@ -109,6 +116,9 @@ def main():
         check("初始资金", capital > 0, f"${capital:,.0f}",
               "initial_capital 需要 > 0")
 
+        # 实盘余额校验用：CLI --capital 优先，其次 config.initial_capital
+        effective_capital = args.capital if args.capital is not None else capital
+
     # ------------------------------------------------------------------
     print("\n🌐 3. 网络连通性")
     # ------------------------------------------------------------------
@@ -149,9 +159,10 @@ def main():
                         (b for b in info["balances"] if b["asset"] == "USDT"),
                         {"free": "0"}
                     )
-                    results["spot_read"] = (True, f"USDT 余额: ${float(usdt['free']):,.2f}")
+                    bal = float(usdt['free'])
+                    results["spot_read"] = (True, f"USDT 余额: ${bal:,.2f}", bal)
                 except Exception as e:
-                    results["spot_read"] = (False, str(e)[:80])
+                    results["spot_read"] = (False, str(e)[:80], None)
 
                 # 合约余额
                 try:
@@ -161,19 +172,44 @@ def main():
                         (b for b in balances if b["asset"] == "USDT"),
                         {"availableBalance": "0"}
                     )
-                    results["futures_read"] = (True, f"USDT 余额: ${float(usdt['availableBalance']):,.2f}")
+                    bal = float(usdt['availableBalance'])
+                    results["futures_read"] = (True, f"USDT 余额: ${bal:,.2f}", bal)
                 except Exception as e:
-                    results["futures_read"] = (False, str(e)[:80])
+                    results["futures_read"] = (False, str(e)[:80], None)
 
                 return results
 
             perms = asyncio.run(test_permissions())
 
-            for name, (ok, msg) in perms.items():
+            for name, (ok, msg, _bal) in perms.items():
                 label = "现货账户读取" if "spot" in name else "合约账户读取"
                 check(label, ok, msg, msg)
                 if not ok:
                     all_ok = False
+
+            # 实盘模式：硬卡两侧 USDT 余额 ≥ effective_capital
+            if live_mode:
+                spot_bal = perms.get("spot_read", (False, "", None))[2]
+                fut_bal = perms.get("futures_read", (False, "", None))[2]
+
+                if spot_bal is not None:
+                    if not check(
+                        f"现货 USDT free ≥ ${effective_capital:,.2f}",
+                        spot_bal >= effective_capital,
+                        f"${spot_bal:,.2f} ≥ ${effective_capital:,.2f}",
+                        f"现货 free=${spot_bal:,.2f} 不足；请充值或调低 initial_capital "
+                        f"（如有现货持仓占用，先平仓再试）",
+                    ):
+                        all_ok = False
+
+                if fut_bal is not None:
+                    if not check(
+                        f"合约 USDT availableBalance ≥ ${effective_capital:,.2f}",
+                        fut_bal >= effective_capital,
+                        f"${fut_bal:,.2f} ≥ ${effective_capital:,.2f}",
+                        f"合约 availableBalance=${fut_bal:,.2f} 不足；请划转保证金或调低 initial_capital",
+                    ):
+                        all_ok = False
         else:
             print(f"  {SKIP} 需要先配置 API Key")
     else:
@@ -246,7 +282,7 @@ def main():
     # ------------------------------------------------------------------
     # 总结
     # ------------------------------------------------------------------
-    mode = "监控模式" if monitor_only else "完整交易模式"
+    mode = "监控模式" if monitor_only else ("实盘模式" if live_mode else "完整交易模式")
     print(f"\n{'='*50}")
     if all_ok:
         print(f"  {PASS} 全部检查通过! 可以启动 ({mode})")
@@ -258,6 +294,11 @@ def main():
     else:
         print(f"  {FAIL} 有未通过的检查项，请修复后重试")
     print(f"{'='*50}\n")
+
+    # 实盘模式必须 fail-fast：让 deploy.sh 的 `set -e` 拦住后续步骤
+    # 其它模式保留旧行为（exit 0），避免破坏 simulate/monitor 路径
+    if live_mode and not all_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

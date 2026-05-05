@@ -197,8 +197,8 @@ echo ""
 echo "🔍 Step 4: 运行预检"
 
 if [ "$MODE" = "live" ]; then
-    hint "实盘模式: 运行完整预检（含下单权限 / 保证金 / 手续费档位）"
-    python preflight.py
+    hint "实盘模式: 运行完整预检（含下单权限 / 安全模式 / 余额 ≥ \$$CAPITAL 硬卡）"
+    python preflight.py --live --capital "$CAPITAL"
 else
     hint "模拟模式: 只跑只读预检"
     python preflight.py --monitor
@@ -274,6 +274,16 @@ Restart=always
 RestartSec=30
 StartLimitIntervalSec=300
 StartLimitBurst=5
+
+# 内存约束：稳态 ~150MB / 启动尖峰 ~250MB；MemoryMax 给 1.6× 余量
+# 超出 MemoryMax 由 cgroup OOM 只杀本服务，不会拖垮全机；Restart=always 自动拉起
+MemoryHigh=300M
+MemoryMax=400M
+
+# 关闭超时：默认 90s；缩短到 15s 让 systemctl restart 时旧进程更快退出，
+# 避免新旧进程同时存在的尖峰双吞内存
+TimeoutStopSec=15s
+KillMode=mixed
 
 # 日志
 StandardOutput=append:${PROJECT_DIR}/logs/${SERVICE_NAME}.log

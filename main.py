@@ -17,6 +17,7 @@
 """
 import argparse
 import asyncio
+import sys
 import yaml
 import signal
 from datetime import datetime, timezone
@@ -57,7 +58,8 @@ class FundingArbitrageBot:
         self.mode = mode
 
         self.screener = DynamicScreener(config, plan)
-        self.monitor = FundingRateMonitor(config)
+        # 共用 screener 的 ccxt 客户端：省 ~80MB markets metadata，rate limiter 全局生效
+        self.monitor = FundingRateMonitor(config, exchange=self.screener.exchange)
         self.fees_cfg = config["fees"]
         self.risk = config["strategy"]["risk"]
         self.running = True
@@ -375,8 +377,10 @@ class FundingArbitrageBot:
             used = sum(p["usdt_amount"] for p in open_pos)
             available = self.plan.tradable - used
 
-            if available < 500:
-                logger.info(f"可用不足 ${available:.0f}")
+            # 至少要够开"最小单仓的一半"，防止 leftover 太碎；自动跟随 tradable 伸缩
+            min_available = min(t.max_position for t in self.plan.tiers.values()) * 0.5
+            if available < min_available:
+                logger.info(f"可用不足 ${available:.0f} (需 >= ${min_available:.0f})")
                 return
 
             # 日亏损上限检查
@@ -827,10 +831,14 @@ def main():
 
     if mode == "live":
         print_plan(plan)
-        confirm = input("\n  ⚠️  实盘模式，确认? [Y/n] ").strip().lower()
-        if confirm and confirm != "y":
-            print("  已取消")
-            return
+        if sys.stdin.isatty():
+            confirm = input("\n  ⚠️  实盘模式，确认? [Y/n] ").strip().lower()
+            if confirm and confirm != "y":
+                print("  已取消")
+                return
+        else:
+            # systemd / nohup 等无 TTY 环境：deploy.sh 的 YES-LIVE 已经把过关
+            logger.info("实盘模式（非交互环境，跳过二次确认）")
 
     bot = FundingArbitrageBot(config, plan, mode=mode)
     loop = asyncio.new_event_loop()
