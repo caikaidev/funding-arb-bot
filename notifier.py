@@ -117,3 +117,37 @@ class TelegramNotifier:
 
     async def on_stop(self):
         await self.send("*机器人已停止* 🛑")
+
+    async def on_margin_warn(self, symbol, ratio):
+        await self.send(
+            f"*强平预警* ⚠️\n"
+            f"币种: `{symbol}`\n"
+            f"保证金率: `{ratio:.1%}`"
+        )
+
+    async def on_margin_topup(self, symbol, ratio, amount):
+        await self.send(
+            f"*合约补保证金* 💉\n"
+            f"币种: `{symbol}`\n"
+            f"保证金率: `{ratio:.1%}`\n"
+            f"已划入: `${amount:.2f}`"
+        )
+
+    async def on_margin_critical(self, symbol, ratio, reason):
+        await self.send(
+            f"*紧急强平防护* 🚨\n"
+            f"币种: `{symbol}`\n"
+            f"保证金率: `{ratio:.1%}`\n"
+            f"原因: {reason}\n"
+            f"已触发双腿强制平仓",
+            urgent=True,
+        )
+
+    async def on_rebalance(self, direction, amount, spot_after, fut_after):
+        await self.send(
+            f"*钱包再平衡* 🔄\n"
+            f"方向: `{direction}`\n"
+            f"金额: `${amount:.2f}`\n"
+            f"现货 USDT: `${spot_after:.2f}`\n"
+            f"合约 USDT: `${fut_after:.2f}`"
+        )

@@ -239,6 +239,18 @@ def main():
                              "enableWithdrawals=True — 请在 Binance API 管理页关闭提现权限"):
                     all_ok = False
 
+                # 内部划转权限：用于平仓后 spot/futures 钱包自动 rebalance + 强平防护补保证金
+                xfer_cfg = (cfg.get("transfer") or {})
+                xfer_enabled = bool(xfer_cfg.get("enabled", False))
+                if xfer_enabled:
+                    has_xfer = perms.get("enableInternalTransfer", False)
+                    if not check("API 内部划转权限已开启", has_xfer,
+                                 "enableInternalTransfer=True",
+                                 "transfer.enabled=true 但 API 未开启内部划转，请在 Binance API 管理页开启"):
+                        all_ok = False
+                else:
+                    print(f"  {SKIP} API 内部划转权限 — config.transfer.enabled=false，跳过")
+
                 if perms.get("ipRestrict", False):
                     check("API IP 白名单", True, "已绑定固定 IP")
                 else:

@@ -109,6 +109,32 @@ split_thresholds:
   default: 5000                   # 其余币种默认阈值
 
 # --------------------------------------------------
+# 资金划转（Spot ↔ USDⓈ-M Futures）
+# 需要 API key 开启 "Enable Internal Transfer"（不需要提现权限）
+# --------------------------------------------------
+transfer:
+  enabled: true                   # 开/平仓后自动 rebalance + 补保证金需要
+  asset: "USDT"
+  max_pct_per_transfer: 0.50      # 单次划转上限 = initial_capital × 50%
+  max_pct_per_day: 1.0            # 当日累计划转上限 = initial_capital × 100%
+  retry_attempts: 2               # 划转失败重试次数（指数退避）
+  retry_backoff: 1.0              # 重试初始 backoff 秒数
+
+# --------------------------------------------------
+# 强平防护（监控合约风险水平，分级响应）
+# --------------------------------------------------
+margin_guard:
+  enabled: true
+  warn_ratio: 0.50                # risk >= 50%: TG 告警
+  topup_ratio: 0.70               # risk >= 70%: 自动从现货划入保证金
+  critical_ratio: 0.85            # risk >= 85% / topup 失败: 强制双腿平仓
+  topup_target_ratio: 0.50        # 补保证金后目标拉回的 risk
+  topup_cooldown_seconds: 300     # 同一 symbol 连续补仓间最小间隔
+  spot_buffer_pct: 0.10           # 现货留 10% 余量不动用，避免补到 0
+  safe_distance_pct: 0.50         # liq 距离换算 risk 时的"安全距离"基准（mark→liq 距离≥该值视为 0 风险）
+  check_interval_minutes: 1       # 检查频率（分钟）
+
+# --------------------------------------------------
 # 通知 & 调度
 # --------------------------------------------------
 telegram:

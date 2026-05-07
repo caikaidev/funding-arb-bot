@@ -30,6 +30,8 @@ from screener import DynamicScreener, classify, _to_ccxt
 from monitor import FundingRateMonitor
 from position import PositionManager
 from notifier import TelegramNotifier
+from transfer_service import TransferService, TransferLimitExceeded
+from margin_guard import MarginGuard
 
 logger.add(
     "logs/bot_{time:YYYY-MM-DD}.log",
@@ -97,6 +99,28 @@ class FundingArbitrageBot:
             from reconciler import Reconciler
             self.reconciler = Reconciler(self.executor, self.positions, self.notifier)
 
+        # 资金划转 / 强平防护（live + simulate 都装；simulate 下 SDK 为 None 自动跳过）
+        self.transfer_service = None
+        self.margin_guard = None
+        # 互斥：保护"会改写两边钱包余额"的操作（开/平仓 vs 划转 vs 补保证金）
+        self._wallet_lock = asyncio.Lock()
+        # 单轮扫描内只在末尾 rebalance 一次的标志
+        self._rebalance_pending = False
+        if mode in ("live", "simulate") and self.executor is not None:
+            spot_sdk = getattr(self.executor, "spot", None)
+            self.transfer_service = TransferService(
+                spot_sdk=spot_sdk,
+                capital_plan=plan,
+                config=config,
+            )
+            self.margin_guard = MarginGuard(
+                executor=self.executor,
+                positions=self.positions,
+                transfer_service=self.transfer_service,
+                notifier=self.notifier,
+                config=config,
+            )
+
     # ==================================================================
     # 守卫方法
     # ==================================================================
@@ -113,6 +137,87 @@ class FundingArbitrageBot:
                 await self.notifier.on_error(err)
             except Exception:
                 pass
+
+    def _mark_rebalance_pending(self) -> None:
+        """标记本轮扫描需要 rebalance；实际查询/划转延后到扫描末尾统一执行一次。"""
+        self._rebalance_pending = True
+
+    async def _maybe_rebalance(self) -> None:
+        """如果有标记则执行一次再平衡，并清除 pending 标记。"""
+        if not getattr(self, "_rebalance_pending", False):
+            return
+        self._rebalance_pending = False
+        await self._rebalance_after_trade()
+
+    async def _rebalance_after_trade(self) -> None:
+        """开/平仓后把现货和合约 USDT 余额拉回 50/50（差额超过阈值才动）。"""
+        ts = getattr(self, "transfer_service", None)
+        if not ts or not getattr(ts, "enabled", False):
+            # 只在前面真的有开/平仓动作时（pending 标记被清掉前已记下）才提一次
+            if getattr(self, "_warned_transfer_disabled", False) is False:
+                logger.info("[再平衡] transfer.enabled=false，跳过自动 rebalance")
+                self._warned_transfer_disabled = True
+            return
+
+        lock = getattr(self, "_wallet_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._wallet_lock = lock
+
+        async with lock:
+            try:
+                spot = self.executor.get_spot_balance("USDT")
+                fut = self.executor.get_futures_balance("USDT")
+            except Exception as e:
+                logger.warning(f"[再平衡] 余额查询失败: {e}")
+                return
+
+            total = spot + fut
+            if total <= 0:
+                return
+            target = total / 2
+            diff = abs(spot - target)
+            # 差额阈值：最小单仓的 25%，且不少于 $100
+            try:
+                min_pos = min(t.max_position for t in self.plan.tiers.values())
+            except ValueError:
+                min_pos = 0
+            threshold = max(100.0, min_pos * 0.25)
+            if diff < threshold:
+                return
+
+            try:
+                if spot > target:
+                    ok = ts.spot_to_futures(diff)
+                    direction = "spot_to_futures"
+                else:
+                    ok = ts.futures_to_spot(diff)
+                    direction = "futures_to_spot"
+            except TransferLimitExceeded as e:
+                logger.warning(f"[再平衡] 超限跳过: {e}")
+                return
+            except Exception as e:
+                logger.error(f"[再平衡] 异常: {e}")
+                return
+
+        if ok and self.notifier:
+            try:
+                await self.notifier.on_rebalance(direction, diff, spot, fut)
+            except Exception:
+                pass
+
+    async def _task_margin_guard(self):
+        if not self.margin_guard:
+            return
+        lock = getattr(self, "_wallet_lock", None)
+        try:
+            if lock is not None:
+                async with lock:
+                    await self.margin_guard.check_and_protect()
+            else:
+                await self.margin_guard.check_and_protect()
+        except Exception as e:
+            logger.exception(f"强平防护任务异常: {e}")
 
     async def _mark_partial_close_risk(self, symbol: str) -> None:
         """
@@ -291,6 +396,7 @@ class FundingArbitrageBot:
                 )
             except Exception:
                 pass
+        self._mark_rebalance_pending()
         return True
 
     # ==================================================================
@@ -546,6 +652,8 @@ class FundingArbitrageBot:
                         f"{coin['binance_symbol']} ${actual_usdt:.0f}"
                     )
 
+                    self._mark_rebalance_pending()
+
         except Exception as e:
             logger.exception(f"扫描异常: {e}")
             if self.notifier:
@@ -555,6 +663,7 @@ class FundingArbitrageBot:
                     pass
         finally:
             await self._flush_executor_alerts()
+            await self._maybe_rebalance()
 
     # ==================================================================
     # 模拟 / 实盘：持仓检查→平仓
@@ -671,6 +780,8 @@ class FundingArbitrageBot:
                             except Exception:
                                 pass
 
+                        self._mark_rebalance_pending()
+
         except Exception as e:
             logger.exception(f"持仓检查异常: {e}")
             if self.notifier:
@@ -680,6 +791,7 @@ class FundingArbitrageBot:
                     pass
         finally:
             await self._flush_executor_alerts()
+            await self._maybe_rebalance()
 
     # ==================================================================
     # 费率结算（模拟和实盘共用）
@@ -780,6 +892,12 @@ class FundingArbitrageBot:
             sched.add_job(self.task_daily_report, "cron", hour=0, minute=30, id="report", **job_defaults)
             if self.reconciler:
                 sched.add_job(self._task_reconcile, "interval", hours=1, id="reconcile", **job_defaults)
+            if self.margin_guard and self.margin_guard.enabled:
+                mg_min = int(self.config.get("margin_guard", {}).get("check_interval_minutes", 1))
+                sched.add_job(
+                    self._task_margin_guard, "interval", minutes=mg_min,
+                    id="margin_guard", **job_defaults,
+                )
 
         sched.start()
 

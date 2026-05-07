@@ -27,6 +27,8 @@ class SimulatedExecutor(BaseExecutor):
         self.max_single_order_usdt = config["strategy"]["risk"].get("max_single_order_usdt") or 0
         self.split_thresholds = config.get("split_thresholds", {})
         self._critical_errors: list[str] = []
+        self.spot = None
+        self.futures = None
 
     def open_arbitrage(
         self,
