@@ -146,12 +146,12 @@ class FundingArbitrageBot:
         return slot.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _passes_break_even(self, coin: dict, alloc: float) -> bool:
-        """预期回本检查：min_holding_hours 内累计资金费 ≥ 双程手续费 × 1.5"""
+        """预期回本检查：min_holding_hours 内累计资金费 ≥ 双程手续费 × 1.2"""
         rate = abs(coin["rate"])
         min_hold = self.config["strategy"]["exit"].get("min_holding_hours", 24)
         expected_funding = alloc * rate * (min_hold / 8)
         two_way_fee = self._calc_fees(alloc) * 2
-        return expected_funding >= two_way_fee * 1.5
+        return expected_funding >= two_way_fee * 1.2
 
     # ==================================================================
     # 动态换仓
@@ -456,7 +456,7 @@ class FundingArbitrageBot:
                 if not self._passes_break_even(coin, alloc):
                     logger.info(
                         f"跳过 {coin['binance_symbol']}: 费率 {coin['rate']:.4%} "
-                        f"不足以覆盖手续费（min_holding_hours 内预期收益 < 双程费 ×1.5）"
+                        f"不足以覆盖手续费（min_holding_hours 内预期收益 < 双程费 ×1.2）"
                     )
                     continue
 

@@ -242,9 +242,9 @@ class TestSettlementWindow(unittest.TestCase):
 class TestPassesBreakEven(unittest.TestCase):
     """
     BNB 折扣关：双程手续费 = amount × (0.001 + 0.0004) × 2 = amount × 0.0028
-    回本门槛（×1.5） = amount × 0.0042
+    回本门槛（×1.2） = amount × 0.00336
     min_holding_hours=24 → 3 次结算（24/8）
-    所需费率 ≥ 0.0042 / 3 = 0.0014 / 8h
+    所需费率 ≥ 0.00336 / 3 = 0.00112 / 8h
     """
 
     def setUp(self):
@@ -258,15 +258,15 @@ class TestPassesBreakEven(unittest.TestCase):
         self.assertTrue(self.bot._passes_break_even({"rate": 0.002}, 3000))
 
     def test_low_rate_fails(self):
-        # 0.1%/8h → 3 次 = 0.003 × 3000 = 9 < 12.6 ✗
+        # 0.1%/8h → 3 次 = 0.003 × 3000 = 9 < 10.08 ✗
         self.assertFalse(self.bot._passes_break_even({"rate": 0.001}, 3000))
 
     def test_exact_threshold_passes(self):
-        # 0.0014 → 3 次 = 0.0042 × 3000 = 12.6 = 12.6，>= 成立 ✓
-        self.assertTrue(self.bot._passes_break_even({"rate": 0.0014}, 3000))
+        # 0.00112 → 3 次 = 0.00336 × 3000 = 10.08 = 10.08，>= 成立 ✓
+        self.assertTrue(self.bot._passes_break_even({"rate": 0.00112}, 3000))
 
     def test_just_below_threshold_fails(self):
-        self.assertFalse(self.bot._passes_break_even({"rate": 0.00139}, 3000))
+        self.assertFalse(self.bot._passes_break_even({"rate": 0.00111}, 3000))
 
     def test_negative_rate_uses_abs(self):
         """方向无关，取绝对值后计算（正常不会进来，但防御）"""
@@ -522,8 +522,8 @@ class TestOpenUsesActualUsdtFees(unittest.IsolatedAsyncioTestCase):
             "tier": 1,
             "tier_name": "T1 核心",
             "direction": "positive",
-            "rate": 0.001,
-            "annualized": 0.1,
+            "rate": 0.002,
+            "annualized": 0.2,
             "mid_price": 60000.0,
             "score": 90.0,
         }])
