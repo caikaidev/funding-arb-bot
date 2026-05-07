@@ -16,11 +16,11 @@ TIER2_BASES = {
 # 流动性门槛（固定，与资金量无关）
 # min_rate 单位: 8h 费率。年化 = min_rate × 3 × 365
 # T1/T2 = 0.0001 ≈ 10.95% 年化（盘活流动性极好的核心币种）
-# T3   = 0.0004 ≈ 43.8% 年化（小币波动大，要更高门槛覆盖风险）
+# T3   = 0.0003 ≈ 32.9% 年化（贴 break-even 底；min_depth 50K 是 T3 实测能过的最松值）
 TIER_THRESHOLDS = {
     1: {"min_vol": 500e6, "min_oi": 200e6, "max_spread": 0.0003, "min_depth": 1e6, "min_rate": 0.0001, "min_hours": 0},
     2: {"min_vol": 100e6, "min_oi": 50e6,  "max_spread": 0.0005, "min_depth": 500e3, "min_rate": 0.0001, "min_hours": 0},
-    3: {"min_vol": 20e6,  "min_oi": 10e6,  "max_spread": 0.001,  "min_depth": 100e3, "min_rate": 0.0004, "min_hours": 48},
+    3: {"min_vol": 20e6,  "min_oi": 10e6,  "max_spread": 0.001,  "min_depth": 50e3,  "min_rate": 0.0003, "min_hours": 48},
 }
 
 

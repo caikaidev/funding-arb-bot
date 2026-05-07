@@ -2,6 +2,8 @@
 动态币种筛选器 v4 — 资金分配由 CapitalPlan 驱动
 """
 import asyncio
+import json
+import urllib.request
 import ccxt.async_support as ccxt
 from datetime import datetime, timezone
 from loguru import logger
@@ -26,6 +28,8 @@ class DynamicScreener:
         self.plan = plan
         self._market_cache = {}
         self._cache_time = None
+        self._spot_cache: set[str] = set()
+        self._spot_cache_time = None
 
     def update_plan(self, plan: CapitalPlan):
         """运行时更新资金方案（比如加减资金后）"""
@@ -72,6 +76,7 @@ class DynamicScreener:
     # ------------------------------------------------------------------
     async def screen(self) -> list[dict]:
         markets = await self._load_markets()
+        spot_symbols = await self._load_spot_symbols()
 
         # T3 关则只扫 T1+T2
         active_tiers = set(self.plan.tiers.keys())
@@ -82,12 +87,18 @@ class DynamicScreener:
 
         # 费率初筛（只做正费率：现货账户不支持裸空，负费率无法实现）
         candidates = []
+        skipped_no_spot = 0
         for sym, fr in rates.items():
             base = sym.split("/")[0]
             if base in BLACKLIST_BASES:
                 continue
             tier = classify(sym)
             if tier not in active_tiers:
+                continue
+            # futures-only 永续（xStocks/商品/Binance 永续独占等）无法做现货对冲，整轮跳过
+            binance_sym = sym.replace("/", "").replace(":USDT", "")
+            if spot_symbols and binance_sym not in spot_symbols:
+                skipped_no_spot += 1
                 continue
             thresh = TIER_THRESHOLDS[tier]
             rate = fr.get("fundingRate", 0)
@@ -100,7 +111,7 @@ class DynamicScreener:
                     "predicted_rate": fr.get("nextFundingRate"),
                 })
 
-        logger.info(f"费率初筛: {len(candidates)} 个")
+        logger.info(f"费率初筛: {len(candidates)} 个 (剔除 futures-only: {skipped_no_spot})")
 
         # 精筛
         qualified = []
@@ -189,6 +200,35 @@ class DynamicScreener:
         }
         self._cache_time = now
         return self._market_cache
+
+    async def _load_spot_symbols(self) -> set[str]:
+        """缓存现货 USDT pair 列表 (5min TTL)。失败时保留旧缓存，空缓存即"失能"
+        过滤（fail-open，避免 REST 抖动把 T1/T2 也挡掉）。"""
+        now = datetime.now(timezone.utc)
+        if self._spot_cache and self._spot_cache_time \
+                and (now - self._spot_cache_time).total_seconds() < 300:
+            return self._spot_cache
+
+        def _fetch():
+            req = urllib.request.Request(
+                "https://api.binance.com/api/v3/exchangeInfo",
+                headers={"User-Agent": "arb-bot/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read())
+
+        try:
+            data = await asyncio.to_thread(_fetch)
+            syms = {
+                s["symbol"] for s in data.get("symbols", [])
+                if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT"
+            }
+            if syms:
+                self._spot_cache = syms
+                self._spot_cache_time = now
+        except Exception as e:
+            logger.warning(f"加载现货 pair 列表失败 (沿用旧缓存): {e}")
+        return self._spot_cache
 
     async def _batch_rates(self, symbols):
         result = {}
