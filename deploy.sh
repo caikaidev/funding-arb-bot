@@ -196,6 +196,18 @@ fi
 echo ""
 echo "🔍 Step 4: 运行预检"
 
+# transfer.enabled=true 时（默认）需要 API 开启 "Enable Internal Transfer"
+TRANSFER_ENABLED=$(python -c "
+import yaml
+c = yaml.safe_load(open('config.yaml'))
+print(str((c.get('transfer') or {}).get('enabled', False)).lower())
+" 2>/dev/null || echo "false")
+
+if [ "$TRANSFER_ENABLED" = "true" ]; then
+    hint "transfer.enabled=true：需要 API Key 开启「Enable Internal Transfer」（不需提现权限）"
+    hint "  用途：开/平仓后 spot↔futures 钱包再平衡 + 强平防护补保证金"
+fi
+
 if [ "$MODE" = "live" ]; then
     hint "实盘模式: 运行完整预检（含下单权限 / 安全模式 / 余额 ≥ \$$CAPITAL 硬卡）"
     python preflight.py --live --capital "$CAPITAL"
