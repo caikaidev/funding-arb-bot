@@ -90,33 +90,32 @@ class BinanceExecutor(BaseExecutor):
     # 精度处理
     # ------------------------------------------------------------------
     @_query_retry
-    def _get_precision(self, symbol: str) -> dict:
-        """获取交易对的精度信息"""
-        if symbol in self._precision_cache:
-            return self._precision_cache[symbol]
-
+    def _preload_precision(self) -> None:
+        """启动时一次性加载全量交易对精度，避免每次 cache miss 都拉取 ~2MB 的 exchange_info"""
+        if self._precision_cache:
+            return
         info = self.futures.exchange_info()
         for s in info["symbols"]:
-            if s["symbol"] == symbol:
-                qty_precision = s["quantityPrecision"]
-                price_precision = s["pricePrecision"]
-                # 获取最小下单量
-                min_qty = None
-                step_size = None
-                for f in s["filters"]:
-                    if f["filterType"] == "LOT_SIZE":
-                        min_qty = float(f["minQty"])
-                        step_size = float(f["stepSize"])
+            min_qty = None
+            step_size = None
+            for f in s["filters"]:
+                if f["filterType"] == "LOT_SIZE":
+                    min_qty = float(f["minQty"])
+                    step_size = float(f["stepSize"])
+            self._precision_cache[s["symbol"]] = {
+                "qty_precision": s["quantityPrecision"],
+                "price_precision": s["pricePrecision"],
+                "min_qty": min_qty,
+                "step_size": step_size,
+            }
+        logger.info(f"预加载交易精度: {len(self._precision_cache)} 个交易对")
 
-                result = {
-                    "qty_precision": qty_precision,
-                    "price_precision": price_precision,
-                    "min_qty": min_qty,
-                    "step_size": step_size,
-                }
-                self._precision_cache[symbol] = result
-                return result
-
+    def _get_precision(self, symbol: str) -> dict:
+        """获取交易对的精度信息（首次调用时触发全量预加载）"""
+        if not self._precision_cache:
+            self._preload_precision()
+        if symbol in self._precision_cache:
+            return self._precision_cache[symbol]
         raise ValueError(f"未找到交易对 {symbol}")
 
     def _round_qty(self, qty: float, symbol: str) -> str:

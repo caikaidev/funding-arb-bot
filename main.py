@@ -15,12 +15,13 @@
   ✅ 一周后用 results.py 查看完整损益报告
   ❌ 不发送任何真实订单
 """
-import argparse
 import asyncio
+import argparse
+import glob
 import sys
 import yaml
 import signal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from loguru import logger
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -314,6 +315,21 @@ class FundingArbitrageBot:
                 writer.writeheader()
             writer.writerows(rows)
 
+    def _cleanup_old_csv(self, keep_days: int = 7) -> None:
+        """清理 N 天前的 CSV 快照，防止磁盘写满（~13 MB/天）"""
+        import os
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).strftime("%Y%m%d")
+        for f in glob.glob("logs/monitor-candidates-*.csv"):
+            # 文件名: monitor-candidates-20260507.csv
+            basename = os.path.basename(f)
+            date_part = basename.replace("monitor-candidates-", "").replace(".csv", "")
+            if date_part < cutoff:
+                try:
+                    os.remove(f)
+                    logger.info(f"清理旧快照: {basename}")
+                except OSError as e:
+                    logger.warning(f"清理快照失败 {basename}: {e}")
+
     async def task_monitor_scan(self):
         try:
             # 阶段 1 数据采集: 在 screen 之前先落一份全量快照（含 T3 且不过滤）
@@ -354,6 +370,9 @@ class FundingArbitrageBot:
                 used += alloc
 
             logger.info(f"{'='*70}")
+
+            # 清理过期 CSV 快照
+            self._cleanup_old_csv()
 
         except Exception as e:
             logger.exception(f"监控异常: {e}")

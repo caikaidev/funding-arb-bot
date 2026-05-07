@@ -194,8 +194,10 @@ class DynamicScreener:
         if self._cache_time and (now - self._cache_time).total_seconds() < 300:
             return self._market_cache
         markets = await self.exchange.load_markets(True)
+        # 只保留实际使用的字段：key 用于遍历，value 只需要 onboardDate（listing age）
         self._market_cache = {
-            k: v for k, v in markets.items()
+            k: {"info": {"onboardDate": v.get("info", {}).get("onboardDate")}}
+            for k, v in markets.items()
             if v.get("swap") and v.get("quote") == "USDT" and v.get("active")
         }
         self._cache_time = now

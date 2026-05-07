@@ -77,3 +77,37 @@ bash deploy.sh
 - Symbol format conversion: Binance native format is `BTCUSDT`, ccxt format is `BTC/USDT:USDT`. The helper `_to_ccxt()` in `screener.py` converts between them.
 - SQLite databases are mode-separated: `simulate.db` vs `arbitrage.db`.
 - Config uses proportion-driven design: only `initial_capital` needs to be set, everything else derives from percentages in `config.yaml`.
+
+## Memory & Long-Running Constraints
+
+This bot runs 24/7 on small VPS (typically 912 MiB RAM, 20-40 GB disk). All code must be written with long-running stability in mind.
+
+### Data Loading Rules
+
+- **Never load entire datasets into memory.** Backtest, results, and any data analysis must use streaming/iterators (e.g., `backtest.py`'s `stream_snapshots()` yields one scan round at a time, peak < 5 MiB).
+- **Never `SELECT *` without `WHERE` in hot paths.** Queries called every scan cycle (e.g., `get_open_positions`, `get_daily_pnl`) must have indexed columns in their WHERE clauses.
+- **Avoid `LIKE` for date filtering** — use `BETWEEN` with an index on the timestamp column. `LIKE 'YYYY-MM-DD%'` forces full table scan.
+- **Large API responses (exchangeInfo, fetch_funding_rates) must be consumed and released promptly.** Extract only needed fields; do not store raw responses in long-lived caches.
+
+### Cache & Growth Rules
+
+- **All in-memory caches must have a TTL or size cap.** Never let a dict/set/list grow unboundedly. Use overwrite-on-refresh pattern (see `_market_cache` with 5-min TTL).
+- **Deduplication sets that grow over time** (e.g., `_funding_done` in `backtest.py`) should be periodically pruned or use a sliding window. For unbounded data, prefer `CREATE UNIQUE INDEX ... INSERT OR IGNORE` in SQLite over in-memory sets.
+- **Thread pools and HTTP sessions should be created once and reused**, not created per-call. `aiohttp.ClientSession` especially must be shared — creating one per request leaks TCP connections.
+
+### SQLite Rules
+
+- **Always use WAL mode** (`PRAGMA journal_mode=WAL`) and set `busy_timeout` (≥ 5000 ms). Default journal mode causes `database is locked` under concurrent APScheduler jobs.
+- **Add indexes on columns used in WHERE/ORDER BY** for any table that grows over time. At minimum: `positions(status)`, `positions(closed_at)`, `funding_logs(settled_at)`.
+- **For columns that store JSON blobs** (e.g., `trade_logs.raw_response`), consider making storage optional and only persisting on error paths.
+
+### File Output Rules
+
+- **Any code that appends to files (CSV, logs) must have a cleanup mechanism.** Loguru handles `.log` files via `retention`, but CSV snapshots and other output files need explicit cleanup (e.g., delete files older than N days).
+- **Monitor-mode CSV snapshots grow ~13 MB/day.** Always pair `_append_raw_csv()` with a cleanup call.
+
+### ccxt / SDK Rules
+
+- **Only one ccxt exchange instance per process.** The `load_markets()` call caches ~80-120 MB of metadata. Screener and Monitor must share the same instance (already done via `exchange=self.screener.exchange`).
+- **When caching market metadata**, only keep fields actually used (`swap`, `quote`, `active`, `info.onboardDate`). Do not cache the full market dict.
+- **`_get_precision()` should pre-build the full cache on startup** from a single `exchange_info()` call, not fetch the full payload on each cache miss.

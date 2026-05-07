@@ -11,6 +11,8 @@ class PositionManager:
 
     def __init__(self, db_path: str = "arbitrage.db"):
         self.conn = sqlite3.connect(db_path)
+        self.conn.execute("PRAGMA journal_mode=WAL")        # 读写并发，不互相阻塞
+        self.conn.execute("PRAGMA busy_timeout=5000")        # 锁等待 5 秒而非立即报错
         self.conn.row_factory = sqlite3.Row  # 返回 dict-like
         self._init_tables()
 
@@ -81,6 +83,10 @@ class PositionManager:
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_funding_logs_pos_settlement
                ON funding_logs(position_id, settlement_key)"""
         )
+        # 加速高频查询（get_open_positions / get_daily_pnl 每 5 分钟调用）
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_closed_at ON positions(closed_at)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_funding_settled ON funding_logs(settled_at)")
         self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -234,13 +240,15 @@ class PositionManager:
         """查询当日盈亏：今日结算的资金费 + 今日平仓的价格盈亏"""
         if date_str is None:
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        start = f"{date_str}T00:00:00"
+        end = f"{date_str}T23:59:59"
         funding_row = self.conn.execute(
-            "SELECT COALESCE(SUM(payment), 0) FROM funding_logs WHERE settled_at LIKE ?",
-            (f"{date_str}%",),
+            "SELECT COALESCE(SUM(payment), 0) FROM funding_logs WHERE settled_at BETWEEN ? AND ?",
+            (start, end),
         ).fetchone()
         close_row = self.conn.execute(
-            "SELECT COALESCE(SUM(close_pnl), 0) FROM positions WHERE closed_at LIKE ? AND status='closed'",
-            (f"{date_str}%",),
+            "SELECT COALESCE(SUM(close_pnl), 0) FROM positions WHERE closed_at BETWEEN ? AND ? AND status='closed'",
+            (start, end),
         ).fetchone()
         return float(funding_row[0]) + float(close_row[0])
 
