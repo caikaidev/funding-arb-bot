@@ -143,6 +143,7 @@ class DynamicScreener:
             qualified.append(c)
 
         qualified.sort(key=lambda x: x["score"], reverse=True)
+        logger.info(f"精筛通过: {len(qualified)} 个")
 
         for q in qualified[:8]:
             logger.info(
