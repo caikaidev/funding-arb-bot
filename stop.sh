@@ -94,6 +94,9 @@ fi
 # ---------- restart：单独路径，做完即返回 ----------
 if [ "$ACTION" = "restart" ]; then
     echo "🔄 重启服务"
+    # 无条件 daemon-reload: 防止 unit 文件改过 (Memory/TZ/Restart 等) 但忘记
+    # reload, 导致 systemctl restart 仍按旧配置启动. 开销 < 0.5s, 永远做.
+    sudo systemctl daemon-reload
     sudo systemctl restart "$SERVICE_NAME"
     sleep 2
     if sudo systemctl is-active --quiet "$SERVICE_NAME"; then

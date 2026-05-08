@@ -235,10 +235,17 @@ class FundingArbitrageBot:
 
     @staticmethod
     def _in_settlement_window() -> bool:
-        """检查是否处于 8h 结算封锁窗口 (HH:59:30 – HH:00:30 UTC)"""
+        """检查是否处于 8h funding 结算封锁窗口 (UTC 00/08/16 ± 30s)
+
+        Binance funding 仅在 UTC 00:00 / 08:00 / 16:00 三个整点结算; 只在这三个
+        时刻 ±30s 内封锁开/平/换仓, 避免 settlement 期间下单导致的滑点和费率
+        口径错乱. 早期版本对每小时整点都封锁, 每天浪费 21 个无效窗口.
+        """
         now = datetime.now(timezone.utc)
-        m, s = now.minute, now.second
-        return (m == 59 and s >= 30) or (m == 0 and s <= 30)
+        h, m, s = now.hour, now.minute, now.second
+        pre  = (m == 59 and s >= 30 and ((h + 1) % 24) in (0, 8, 16))
+        post = (m == 0  and s <= 30 and h in (0, 8, 16))
+        return pre or post
 
     @staticmethod
     def _funding_settlement_key(now: datetime | None = None) -> str:
