@@ -2,8 +2,7 @@
 动态币种筛选器 v4 — 资金分配由 CapitalPlan 驱动
 """
 import asyncio
-import json
-import urllib.request
+import aiohttp
 import ccxt.async_support as ccxt
 from datetime import datetime, timezone
 from loguru import logger
@@ -211,16 +210,19 @@ class DynamicScreener:
                 and (now - self._spot_cache_time).total_seconds() < 300:
             return self._spot_cache
 
-        def _fetch():
-            req = urllib.request.Request(
-                "https://api.binance.com/api/v3/exchangeInfo",
-                headers={"User-Agent": "arb-bot/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return json.loads(r.read())
+        async def _fetch():
+            timeout = aiohttp.ClientTimeout(total=30, sock_connect=5, sock_read=10)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(
+                    "https://api.binance.com/api/v3/exchangeInfo",
+                    headers={"User-Agent": "arb-bot/1.0"},
+                ) as r:
+                    return await r.json()
 
         try:
-            data = await asyncio.to_thread(_fetch)
+            # Belt-and-suspenders: aiohttp 多重超时已是 30s 上限，再外套一层
+            # wait_for(35s) 防御 SSL/DNS/aiohttp 自身的边缘 hang。
+            data = await asyncio.wait_for(_fetch(), timeout=35)
             syms = {
                 s["symbol"] for s in data.get("symbols", [])
                 if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT"
@@ -228,7 +230,7 @@ class DynamicScreener:
             if syms:
                 self._spot_cache = syms
                 self._spot_cache_time = now
-        except Exception as e:
+        except (Exception, asyncio.TimeoutError) as e:
             logger.warning(f"加载现货 pair 列表失败 (沿用旧缓存): {e}")
         return self._spot_cache
 
