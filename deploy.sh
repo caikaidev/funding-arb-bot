@@ -287,10 +287,13 @@ RestartSec=30
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
-# 内存约束：稳态 ~150MB / 启动尖峰 ~250MB；MemoryMax 给 1.6× 余量
-# 超出 MemoryMax 由 cgroup OOM 只杀本服务，不会拖垮全机；Restart=always 自动拉起
-MemoryHigh=300M
-MemoryMax=400M
+# 内存约束：912 MiB VPS, RAM 50/65% 上限 + 1.5G swap 兜底
+# 实测启动尖峰 ~334MB（ccxt load_markets + fetch_funding_rates + exchangeInfo），
+# 原 300M/400M 配额导致 cgroup memory reclaim 触发剧烈 swap thrashing,
+# 进程进入 D 态（uninterruptible disk sleep），asyncio 事件循环死锁。
+# 当前配额给启动尖峰 1.8× 余量；swap 兜底防 cgroup reclaim 死锁。
+MemoryHigh=500M
+MemoryMax=600M
 
 # 关闭超时：默认 90s；缩短到 15s 让 systemctl restart 时旧进程更快退出，
 # 避免新旧进程同时存在的尖峰双吞内存
@@ -303,6 +306,8 @@ StandardError=append:${PROJECT_DIR}/logs/${SERVICE_NAME}.log
 
 # 环境
 Environment=PYTHONUNBUFFERED=1
+# 日志展示时区：SGT (UTC+8)。业务代码所有时间戳显式 datetime.now(timezone.utc)，不受影响。
+Environment=TZ=Asia/Singapore
 
 [Install]
 WantedBy=multi-user.target
@@ -348,8 +353,8 @@ echo "  查看状态    sudo systemctl status ${SERVICE_NAME}"
 echo "  查看日志    tail -f ${PROJECT_DIR}/logs/${SERVICE_NAME}.log"
 echo "  实时日志    journalctl -u ${SERVICE_NAME} -f"
 echo "  查看结果    source .venv/bin/activate && python results.py$([ "$MODE" = "live" ] && echo " --db arbitrage.db")"
-echo "  停止服务    sudo systemctl stop ${SERVICE_NAME}"
-echo "  重启服务    sudo systemctl restart ${SERVICE_NAME}"
+echo "  停止服务    bash stop.sh ${MODE}"
+echo "  快速重启    bash stop.sh ${MODE} --restart"
 echo ""
 echo "  切换模式（直接重跑本脚本, 无需手改 service 文件）:"
 if [ "$MODE" = "simulate" ]; then
